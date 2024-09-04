@@ -1,9 +1,9 @@
 package vcd
 
 import (
+	"crypto"
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/pem"
 	"net/url"
 	"os"
@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gitlab.com/gitlab-org/fleeting/fleeting/integration"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
+	"golang.org/x/crypto/ssh"
 )
 
 func TestProvisioning(t *testing.T) {
@@ -48,7 +49,7 @@ func TestProvisioning(t *testing.T) {
 		t.Error("mandatory environment variable VCD_TEMPLATE not set")
 	}
 
-	if os.Getenv("VCD_VAPP") == "" {
+	if os.Getenv("VCD_VAPP_NAME_PREFIX") == "" {
 		t.Error("mandatory environment variable VCD_VAPP not set")
 	}
 
@@ -58,20 +59,21 @@ func TestProvisioning(t *testing.T) {
 
 	pluginBinary := integration.BuildPluginBinary(t, "cmd/fleeting-plugin-vcd", "fleeting-plugin-vcd")
 
-	t.Run("static credentials", func(t *testing.T) {
-		var key PrivPub
+	t.Run("static credentials via ssh keys", func(t *testing.T) {
+		t.Parallel()
 		var err error
-		key, err = rsa.GenerateKey(rand.Reader, 4096)
+		_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 		require.NoError(t, err)
 
-		keyBytes := pem.EncodeToMemory(
-			&pem.Block{
-				Type:  "RSA PRIVATE KEY",
-				Bytes: x509.MarshalPKCS1PrivateKey(key.(*rsa.PrivateKey)),
-			},
-		)
+		pemBlock, err := ssh.MarshalPrivateKey(crypto.PrivateKey(privateKey), "")
+		require.NoError(t, err)
+
+		privateKeyPem := pem.EncodeToMemory(pemBlock)
 
 		parsedURL, err := url.Parse(os.Getenv("VCD_URL"))
+		require.NoError(t, err)
+
+		vAppName, err := generateVMName(os.Getenv("VCD_VAPP_NAME_PREFIX"))
 		require.NoError(t, err)
 
 		integration.TestProvisioning(t,
@@ -87,15 +89,57 @@ func TestProvisioning(t *testing.T) {
 					Token:             os.Getenv("VCD_TOKEN"),
 					Catalog:           os.Getenv("VCD_CATALOG"),
 					Template:          os.Getenv("VCD_TEMPLATE"),
-					VApp:              os.Getenv("VCD_VAPP"),
+					VApp:              vAppName,
 					VMNamePrefix:      os.Getenv("VCD_VM_NAME_PREFIX"),
 					parsedURL:         parsedURL,
 				},
+				// We need write something the Username field here. In reality, the username will be provided by ConnectInfo(),
+				// and as we use VCD+VMware Tools it is always either root or Administrator.
 				ConnectorConfig: provider.ConnectorConfig{
-					Timeout:              10 * time.Minute,
+					Timeout:              30 * time.Minute,
 					UseStaticCredentials: true,
-					Username:             "root",
-					Key:                  keyBytes,
+					Username:             "foobar",
+					Key:                  privateKeyPem,
+				},
+				MaxInstances:    3,
+				UseExternalAddr: true,
+			},
+		)
+	})
+
+	t.Run("static credentials via user/password", func(t *testing.T) {
+		t.Parallel()
+		parsedURL, err := url.Parse(os.Getenv("VCD_URL"))
+		require.NoError(t, err)
+
+		vAppName, err := generateVMName(os.Getenv("VCD_VAPP_NAME_PREFIX"))
+		require.NoError(t, err)
+
+		integration.TestProvisioning(t,
+			pluginBinary,
+			integration.Config{
+				PluginConfig: InstanceGroup{
+					Name:              "vcd",
+					StrURL:            os.Getenv("VCD_URL"),
+					Org:               os.Getenv("VCD_ORG"),
+					VirtualDatacenter: os.Getenv("VCD_VDC"),
+					Network:           os.Getenv("VCD_NETWORK"),
+					IPAllocationMode:  os.Getenv("VCD_NETWORK_ALLOCATION_MODE"),
+					Token:             os.Getenv("VCD_TOKEN"),
+					Catalog:           os.Getenv("VCD_CATALOG"),
+					Template:          os.Getenv("VCD_TEMPLATE"),
+					VApp:              vAppName,
+					VMNamePrefix:      os.Getenv("VCD_VM_NAME_PREFIX"),
+					parsedURL:         parsedURL,
+					StorageProfile:    os.Getenv("VCD_STORAGE_PROFILE"),
+				},
+				// We need write something the Username field here. In reality, the username will be provided by ConnectInfo(),
+				// and as we use VCD+VMware Tools it is always either root or Administrator.
+				ConnectorConfig: provider.ConnectorConfig{
+					Timeout:              30 * time.Minute,
+					UseStaticCredentials: true,
+					Username:             "foobar",
+					Password:             "ExcellentPassword123!",
 				},
 				MaxInstances:    3,
 				UseExternalAddr: true,
