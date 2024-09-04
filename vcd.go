@@ -46,10 +46,12 @@ func (g *InstanceGroup) getVApp() (*govcd.VApp, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	vdc, err := org.GetVDCByName(g.VirtualDatacenter, false)
 	if err != nil {
 		return nil, err
 	}
+
 	vapp, err := vdc.GetVAppByName(g.VApp, true)
 	if err != nil {
 		return nil, err
@@ -92,6 +94,30 @@ func (g *InstanceGroup) createVApp() (*govcd.VApp, error) {
 	return vapp, nil
 }
 
+func (g *InstanceGroup) getStorageProfile(storageProfileName string) (*types.Reference, error) {
+	client, err := newClient(*g.parsedURL, g.Org, g.Token, false)
+	if err != nil {
+		return nil, err
+	}
+
+	org, err := client.GetOrgByName(g.Org)
+	if err != nil {
+		return nil, err
+	}
+
+	vdc, err := org.GetVDCByName(g.VirtualDatacenter, false)
+	if err != nil {
+		return nil, err
+	}
+
+	storageProfile, err := vdc.FindStorageProfileReference(storageProfileName)
+	if err != nil {
+		return nil, err
+	}
+
+	return &storageProfile, nil
+}
+
 func (g *InstanceGroup) getVM(href string) (*govcd.VM, error) {
 	client, err := newClient(*g.parsedURL, g.Org, g.Token, false)
 	if err != nil {
@@ -116,14 +142,16 @@ func (g *InstanceGroup) deleteVM(href string) error {
 
 	vm := govcd.NewVM(&client.Client)
 	vm.VM.HREF = href
+
 	task, err := vm.Undeploy() // we don't care about a hard power-off
 	if err != nil {
-		return err
-	}
-
-	err = task.WaitTaskCompletion()
-	if err != nil {
-		return err
+		// it's fine if the VM is already powered off
+		g.log.Info("unable to undeploy VM, probably because it is already off", "error", err, "vm", vm.VM.Name)
+	} else {
+		err = task.WaitTaskCompletion()
+		if err != nil {
+			return err
+		}
 	}
 
 	err = vm.Delete()
@@ -134,12 +162,35 @@ func (g *InstanceGroup) deleteVM(href string) error {
 	return nil
 }
 
-func (g *InstanceGroup) addVMToVApp() (*govcd.VM, error) {
-	// client, err := newClient(*g.parsedURL, g.Org, g.Token, false)
-	// if err != nil {
-	// 	return nil, err
-	// }
+func (g *InstanceGroup) deleteVApp(href string) error {
+	client, err := newClient(*g.parsedURL, g.Org, g.Token, false)
+	if err != nil {
+		return err
+	}
 
+	vapp := govcd.NewVApp(&client.Client)
+	vapp.VApp.HREF = href
+
+	task, err := vapp.Undeploy()
+	if err != nil {
+		// it's fine if the VApp is already powered off
+		g.log.Info("unable to undeploy VApp, probably because it is already off", "error", err, "vapp", vapp.VApp.Name)
+	} else {
+		err = task.WaitTaskCompletion()
+		if err != nil {
+			return err
+		}
+	}
+
+	task, err = vapp.Delete()
+	if err != nil {
+		return err
+	}
+
+	return task.WaitTaskCompletion()
+}
+
+func (g *InstanceGroup) addVMToVApp() (*govcd.VM, error) {
 	vapp, err := g.getVApp()
 	if err != nil {
 		return nil, err
@@ -160,13 +211,21 @@ func (g *InstanceGroup) addVMToVApp() (*govcd.VM, error) {
 		return nil, err
 	}
 
+	var storageProfile *types.Reference = nil
+	if g.StorageProfile != "" {
+		storageProfile, err = g.getStorageProfile(g.StorageProfile)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// TODO(juanfont): fully use vapp.AddNewVMWithComputePolicy with storage and compute policies
 	task, err := vapp.AddNewVMWithComputePolicy(
 		vmName,
 		template,
-		netSection, // network
-		nil,        // storage
-		nil,        // compute policy
+		netSection,     // network
+		storageProfile, // storage
+		nil,            // compute policy
 		true,
 	)
 	if err != nil {
@@ -283,7 +342,7 @@ func (g *InstanceGroup) injectCredentials(vm *govcd.VM) error {
 		templ := template.Must(template.New("script").Parse(customizationScript))
 		var script bytes.Buffer
 		err = templ.Execute(&script, map[string]string{
-			"PublicKey": string(ssh.MarshalAuthorizedKey(sshPubKey)),
+			"PublicKey": strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPubKey))),
 		})
 		if err != nil {
 			return err
@@ -301,7 +360,7 @@ func newClient(apiURL url.URL, org string, token string, insecure bool) (*govcd.
 	client := &govcd.VCDClient{
 		Client: govcd.Client{
 			VCDHREF:    apiURL,
-			APIVersion: "36.3",
+			APIVersion: "37.3",
 			Http: http.Client{
 				Transport: &http.Transport{
 					TLSClientConfig: &tls.Config{

@@ -16,10 +16,6 @@ func (g *InstanceGroup) validate() error {
 		g.settings.Protocol = provider.ProtocolSSH
 	}
 
-	if g.settings.Username == "" {
-		g.settings.Username = "root"
-	}
-
 	// Checks
 	if g.Name == "" {
 		errs = append(errs, fmt.Errorf("missing required plugin config: name"))
@@ -69,7 +65,7 @@ func (g *InstanceGroup) validate() error {
 	if g.settings.UseStaticCredentials {
 		if g.settings.Password == "" && g.settings.Key == nil {
 			// we don't check Username because with vcd/vmware-tools we have to use either root or Administrator
-			return fmt.Errorf("username and password/key is required when using static credentials")
+			return fmt.Errorf("either root/password password or ssh key are required when using static credentials")
 		}
 	}
 

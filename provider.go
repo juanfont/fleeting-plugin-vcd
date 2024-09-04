@@ -28,6 +28,7 @@ type InstanceGroup struct {
 	Template          string `json:"template"`
 	VApp              string `json:"vapp"` // vApp to deploy workers on
 	VMNamePrefix      string `json:"vm_name_prefix"`
+	StorageProfile    string `json:"storage_profile"`
 
 	size int
 
@@ -152,6 +153,7 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 	info := provider.ConnectInfo{
 		ConnectorConfig: g.settings.ConnectorConfig,
 	}
+
 	vm, err := g.getVM(id)
 	if err != nil {
 		return info, err
@@ -166,6 +168,8 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 		info.OS = "linux"
 		info.Username = "root" // we rely on VMware Guest Customization
 	}
+
+	info.Protocol = provider.ProtocolSSH
 
 	// We assume that the vApp has only one VM with only one NIC
 	if vm.VM.NetworkConnectionSection != nil {
@@ -186,5 +190,6 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 }
 
 func (g *InstanceGroup) Shutdown(ctx context.Context) error {
-	return nil
+	g.log.Info("Shutting down. Deleting vApp", "vApp", g.vAppHREF)
+	return g.deleteVApp(g.vAppHREF)
 }
