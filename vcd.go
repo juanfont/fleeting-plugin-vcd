@@ -246,6 +246,17 @@ func (g *InstanceGroup) addVMToVApp() (*govcd.VM, error) {
 		return nil, err
 	}
 
+	// TODO(juanfont): Change this to also get the number of cores per socket
+	err = vm.ChangeCPUAndCoreCount(&g.CPUCount, &g.CPUCount)
+	if err != nil {
+		return nil, err
+	}
+
+	err = vm.ChangeMemory(g.MemoryMB)
+	if err != nil {
+		return nil, err
+	}
+
 	task, err = vapp.PowerOn()
 	if err != nil {
 		return nil, err
