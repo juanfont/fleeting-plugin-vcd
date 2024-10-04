@@ -29,6 +29,8 @@ type InstanceGroup struct {
 	VApp              string `json:"vapp"` // vApp to deploy workers on
 	VMNamePrefix      string `json:"vm_name_prefix"`
 	StorageProfile    string `json:"storage_profile"`
+	CPUCount          int    `json:"cpu_count"`
+	MemoryMB          int64  `json:"memory_mb"`
 
 	size int
 

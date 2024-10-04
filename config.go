@@ -62,6 +62,14 @@ func (g *InstanceGroup) validate() error {
 		errs = append(errs, fmt.Errorf("missing required plugin config: template"))
 	}
 
+	if g.CPUCount == 0 {
+		errs = append(errs, fmt.Errorf("missing required plugin config: cpu_count"))
+	}
+
+	if g.MemoryMB == 0 {
+		errs = append(errs, fmt.Errorf("missing required plugin config: memory_mb"))
+	}
+
 	if g.settings.UseStaticCredentials {
 		if g.settings.Password == "" && g.settings.Key == nil {
 			// we don't check Username because with vcd/vmware-tools we have to use either root or Administrator
