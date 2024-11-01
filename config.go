@@ -21,10 +21,6 @@ func (g *InstanceGroup) validate() error {
 		errs = append(errs, fmt.Errorf("missing required plugin config: name"))
 	}
 
-	if g.Token == "" {
-		errs = append(errs, fmt.Errorf("missing required plugin config: token"))
-	}
-
 	if g.StrURL == "" {
 		errs = append(errs, fmt.Errorf("missing required plugin config: url"))
 	}
@@ -36,6 +32,10 @@ func (g *InstanceGroup) validate() error {
 
 	if g.Org == "" {
 		errs = append(errs, fmt.Errorf("missing required plugin config: org"))
+	}
+
+	if g.Token == "" {
+		errs = append(errs, fmt.Errorf("missing required plugin config: token"))
 	}
 
 	if g.VirtualDatacenter == "" {
@@ -54,6 +54,14 @@ func (g *InstanceGroup) validate() error {
 		errs = append(errs, fmt.Errorf("invalid ip_allocation_mode: %s", g.IPAllocationMode))
 	}
 
+	if g.InstanceGroupName == "" {
+		errs = append(errs, fmt.Errorf("missing required plugin config: instance_group_name"))
+	}
+
+	if g.VAppNamePrefix == "" {
+		errs = append(errs, fmt.Errorf("missing required plugin config: vapp_name_prefix"))
+	}
+
 	if g.Catalog == "" {
 		errs = append(errs, fmt.Errorf("missing required plugin config: catalog"))
 	}
@@ -62,13 +70,26 @@ func (g *InstanceGroup) validate() error {
 		errs = append(errs, fmt.Errorf("missing required plugin config: template"))
 	}
 
+	if g.StorageProfile == "" {
+		errs = append(errs, fmt.Errorf("missing required plugin config: storage_profile"))
+	}
+
 	if g.CPUCount == 0 {
 		errs = append(errs, fmt.Errorf("missing required plugin config: cpu_count"))
+	}
+
+	if g.CoresPerSocket == 0 {
+		errs = append(errs, fmt.Errorf("missing required plugin config: cores_per_socket"))
 	}
 
 	if g.MemoryMB == 0 {
 		errs = append(errs, fmt.Errorf("missing required plugin config: memory_mb"))
 	}
+
+	// Disk size is optional
+	// if g.DiskSizeGB == 0 {
+	// 	errs = append(errs, fmt.Errorf("missing required plugin config: disk_size_gb"))
+	// }
 
 	if g.settings.UseStaticCredentials {
 		if g.settings.Password == "" && g.settings.Key == nil {
