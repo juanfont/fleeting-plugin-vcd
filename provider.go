@@ -8,11 +8,18 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-hclog"
+	"github.com/vmware/go-vcloud-director/v2/govcd"
 	"github.com/vmware/go-vcloud-director/v2/types/v56"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
+
+const (
+	// vcd does not implement any kind of instance group
+	// so we use a metadata tag to identify the VMs of this fleeting instance group
+	instanceGroupMetadataKey = "fleeting-plugin-vcd"
+)
 
 type InstanceGroup struct {
 	Name string `json:"name"`
@@ -20,22 +27,23 @@ type InstanceGroup struct {
 	// Cloud Director connection config
 	StrURL            string `json:"url"`
 	Org               string `json:"org"`
+	Token             string `json:"token"`
 	VirtualDatacenter string `json:"virtual_datacenter"`
 	Network           string `json:"network"`
-	IPAllocationMode  string `json:"ip_allocation_mode"`
-	Token             string `json:"token"` // API token (vcd > 10.4 required)
+	IPAllocationMode  string `json:"ip_allocation_mode"`  // API token (vcd > 10.4 required)
+	InstanceGroupName string `json:"instance_group_name"` // Metadata tag to use for the VMs of this fleeting instance group
+	VAppNamePrefix    string `json:"vapp_name_prefix"`
 	Catalog           string `json:"catalog"`
 	Template          string `json:"template"`
-	VApp              string `json:"vapp"` // vApp to deploy workers on
-	VMNamePrefix      string `json:"vm_name_prefix"`
 	StorageProfile    string `json:"storage_profile"`
 	CPUCount          int    `json:"cpu_count"`
+	CoresPerSocket    int    `json:"cores_per_socket"`
 	MemoryMB          int64  `json:"memory_mb"`
+	DiskSizeGB        int    `json:"disk_size_gb"`
 
 	size int
 
 	parsedURL *url.URL
-	vAppHREF  string
 
 	log hclog.Logger
 
@@ -59,33 +67,21 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 		return provider.ProviderInfo{}, fmt.Errorf("dynamic credentials are not supported yet")
 	}
 
-	vapp, err := g.getOrCreateVApp()
-	if err != nil {
-		return provider.ProviderInfo{}, fmt.Errorf("getting or creating vApp: %w", err)
-	}
-
-	g.vAppHREF = vapp.VApp.HREF // this speeds-up subsequent calls
-
 	return provider.ProviderInfo{
-		ID:        path.Join("vcd", g.Org, g.VirtualDatacenter, g.Network, g.VApp),
+		ID:        path.Join("vcd", g.Org, g.VirtualDatacenter, g.Network, g.VAppNamePrefix, g.InstanceGroupName),
 		MaxSize:   128, // max number of VMs in a vApp
 		Version:   Version.Version,
 		BuildInfo: Version.BuildInfo(),
 	}, nil
 }
 
-// TODO(juanfont): Right now, the Increase operation is extremely blocking, as it has to add a VM to the vApp one at a time.
-// This is because vcd does not support performing multiple operations in parallel inside the same vApp.
-// One possible solution is to create a new vApp for each VM, but this would require somehow keeping track of the created vApps.
 func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
+	fmt.Println("Increasing")
 	added := 0
 	for i := 1; i <= delta; i++ {
-		vm, err := g.addVMToVApp()
-		if err != nil {
-			continue
-		}
+		go g.createVM()
 		added++
-		g.log.Debug("added VM to vApp", "id", vm.VM.HREF, "name", vm.VM.Name)
+		g.log.Debug("added VM to vApp")
 	}
 
 	return added, nil
@@ -98,9 +94,8 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) ([]str
 	}
 
 	deletedVMs := []string{}
-
 	for _, id := range instances {
-		if err := g.deleteVM(id); err != nil {
+		if err := g.deleteVApp(id); err != nil {
 			g.log.Error("deleting VM", "id", id, "error", err)
 		} else {
 			deletedVMs = append(deletedVMs, id)
@@ -112,41 +107,76 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) ([]str
 
 // Update implements provider.InstanceGroup
 func (g *InstanceGroup) Update(ctx context.Context, update func(instance string, state provider.State)) error {
-	vapp, err := g.getVApp()
+	g.log.Debug("Updating instance group")
+	client, err := newClient(*g.parsedURL, g.Org, g.Token, false)
 	if err != nil {
-		return fmt.Errorf("getting vApp: %w", err)
+		return err
 	}
 
-	if vapp.VApp.Children == nil {
-		g.size = 0
-		return nil
+	vapps, err := g.getVappsInInstanceGroup()
+	if err != nil {
+		g.log.Error("error getting vapps in instance group", "error", err)
+		return fmt.Errorf("getting vapps in instance group: %w", err)
 	}
 
-	g.size = len(vapp.VApp.Children.VM)
+	g.log.Debug("found vapps", "number", len(vapps))
 
-	for _, vm := range vapp.VApp.Children.VM {
+	size := 0
+	for _, vapp := range vapps {
+		g.log.Debug("Checking status of vapp", "vApp", vapp.VApp.Name)
+		if len(vapp.VApp.Children.VM) == 0 {
+			g.log.Debug("vapp has no VMs", "vApp", vapp.VApp.HREF)
+			continue
+		}
+
+		g.log.Debug("refreshing vapp", "vApp", vapp.VApp.Name)
+		err := vapp.Refresh()
+		if err != nil {
+			g.log.Error("error refreshing vapp", "vApp", vapp.VApp.Name, "error", err)
+			continue
+		}
+
+		g.log.Debug("refreshing VM", "vApp", vapp.VApp.HREF)
+		vmHREF := vapp.VApp.Children.VM[0].HREF
+		vm := govcd.NewVM(&client.Client)
+		vm.VM.HREF = vmHREF
+		err = vm.Refresh()
+		if err != nil {
+			g.log.Error("error refreshing VM", "VM", vm.VM.Name, "error", err)
+			continue
+		}
+
+		size++
+
 		var state provider.State
-		switch types.VAppStatuses[vm.Status] {
+		switch types.VAppStatuses[vm.VM.Status] {
 		// The lifecycle in VCD is:
 		// - Deploying UNRESOLVED -> POWERED_OFF -> PARTIALLY_POWERED_OFF -> POWERED_ON
 		// - Deleting POWERED_ON -> PARTIALLY_POWERED_OFF -> POWERED_OFF -> DELETING -> UNKNOWN
-		case "UNRESOLVED":
+		case "UNRESOLVED", "PARTIALLY_POWERED_OFF":
 			state = provider.StateCreating
 		case "POWERED_ON":
 			state = provider.StateRunning
 		case "UNKNOWN":
 			state = provider.StateDeleting
-		case "POWERED_OFF", "PARTIALLY_POWERED_OFF":
-			// as these two states are not final, we just ignore them
-			g.log.Debug("unhandled instance status", "id", vm.HREF, "name", vm.Name, "status", vm.Status)
-		default:
-			g.log.Error("unexpected instance status", "id", vm.HREF, "name", vm.Name, "status", vm.Status)
 
+		default:
+			g.log.Info("unexpected instance status", "id", vm.VM.HREF, "name", vm.VM.Name, "status", vm.VM.Status, "statusName", types.VAppStatuses[vm.VM.Status])
+			if vm.VM.Tasks != nil {
+				for _, t := range vm.VM.Tasks.Task {
+					g.log.Debug("task", "id", t.ID, "status", t.Status, "name", t.Name, "operation", t.Operation, "vm", vm.VM.Name, "vApp", vapp.VApp.Name)
+				}
+			}
+
+			// TODO(juanfont): Check for failed signs and handle then. E.g., there is a task in the VM task list that shows failed
 		}
 
-		update(vm.HREF, state)
+		// we update the state of the VM, but we use the vApp href as id
+		// so it is easier to find the vApp in the API response
+		update(vapp.VApp.HREF, state)
 	}
 
+	g.size = size
 	return nil
 }
 
@@ -156,7 +186,7 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 		ConnectorConfig: g.settings.ConnectorConfig,
 	}
 
-	vm, err := g.getVM(id)
+	vm, err := g.getVMFromVAppHREF(id)
 	if err != nil {
 		return info, err
 	}
@@ -192,6 +222,22 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 }
 
 func (g *InstanceGroup) Shutdown(ctx context.Context) error {
-	g.log.Info("Shutting down. Deleting vApp", "vApp", g.vAppHREF)
-	return g.deleteVApp(g.vAppHREF)
+	vapps, err := g.getVappsInInstanceGroup()
+	if err != nil {
+		return fmt.Errorf("getting vapps in instance group: %w", err)
+	}
+
+	for _, vapp := range vapps {
+		if !strings.HasPrefix(vapp.VApp.Name, g.VAppNamePrefix) {
+			g.log.Warn("skipping vApp deletion", "vApp", vapp.VApp.HREF, "name", vapp.VApp.Name)
+			continue
+		}
+		g.log.Info("Shutting down. Deleting vApp", "vApp", vapp.VApp.HREF)
+		err = g.deleteVApp(vapp.VApp.HREF)
+		if err != nil {
+			g.log.Error("error deleting vApp", "vApp", vapp.VApp.HREF, "error", err)
+		}
+	}
+
+	return nil
 }
