@@ -1,15 +1,22 @@
 package vcd
 
 import (
-	"net/url"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
 	"gitlab.com/gitlab-org/fleeting/fleeting/integration"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
+
+func mustAtoi(s string) int {
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		panic(err)
+	}
+	return i
+}
 
 func TestProvisioning(t *testing.T) {
 	if os.Getenv("VCD_URL") == "" {
@@ -48,10 +55,6 @@ func TestProvisioning(t *testing.T) {
 		t.Error("mandatory environment variable VCD_VAPP not set")
 	}
 
-	if os.Getenv("VCD_VM_NAME_PREFIX") == "" {
-		t.Error("mandatory environment variable VCD_VM_NAME_PREFIX not set")
-	}
-
 	pluginBinary := integration.BuildPluginBinary(t, "cmd/fleeting-plugin-vcd", "fleeting-plugin-vcd")
 
 	// t.Run("static credentials via ssh keys", func(t *testing.T) {
@@ -65,12 +68,6 @@ func TestProvisioning(t *testing.T) {
 
 	// 	privateKeyPem := pem.EncodeToMemory(pemBlock)
 
-	// 	parsedURL, err := url.Parse(os.Getenv("VCD_URL"))
-	// 	require.NoError(t, err)
-
-	// 	vAppName, err := generateVMName(os.Getenv("VCD_VAPP_NAME_PREFIX"))
-	// 	require.NoError(t, err)
-
 	// 	integration.TestProvisioning(t,
 	// 		pluginBinary,
 	// 		integration.Config{
@@ -82,13 +79,15 @@ func TestProvisioning(t *testing.T) {
 	// 				Network:           os.Getenv("VCD_NETWORK"),
 	// 				IPAllocationMode:  os.Getenv("VCD_NETWORK_ALLOCATION_MODE"),
 	// 				Token:             os.Getenv("VCD_TOKEN"),
+	// 				InstanceGroupName:  "fleeting-test-pub-key",
+	// 				VAppNamePrefix:    os.Getenv("VCD_VAPP_NAME_PREFIX"),
 	// 				Catalog:           os.Getenv("VCD_CATALOG"),
 	// 				Template:          os.Getenv("VCD_TEMPLATE"),
-	// 				CPUCount:          4,
-	// 				MemoryMB:          8192,
-	// 				VApp:              vAppName,
-	// 				VMNamePrefix:      os.Getenv("VCD_VM_NAME_PREFIX"),
-	// 				parsedURL:         parsedURL,
+	// 				StorageProfile:    os.Getenv("VCD_STORAGE_PROFILE"),
+	// 				CPUCount:          mustAtoi(os.Getenv("VCD_CPU_COUNT")),
+	// 				CoresPerSocket:    mustAtoi(os.Getenv("VCD_CORES_PER_SOCKET")),
+	// 				MemoryMB:          int64(mustAtoi(os.Getenv("VCD_MEMORY_MB"))),
+	// 				DiskSizeGB:        mustAtoi(os.Getenv("VCD_DISK_SIZE_GB")),
 	// 			},
 	// 			// We need write something the Username field here. In reality, the username will be provided by ConnectInfo(),
 	// 			// and as we use VCD+VMware Tools it is always either root or Administrator.
@@ -106,12 +105,6 @@ func TestProvisioning(t *testing.T) {
 
 	t.Run("static credentials via user/password", func(t *testing.T) {
 		t.Parallel()
-		parsedURL, err := url.Parse(os.Getenv("VCD_URL"))
-		require.NoError(t, err)
-
-		vAppName, err := generateVMName(os.Getenv("VCD_VAPP_NAME_PREFIX"))
-		require.NoError(t, err)
-
 		integration.TestProvisioning(t,
 			pluginBinary,
 			integration.Config{
@@ -123,14 +116,15 @@ func TestProvisioning(t *testing.T) {
 					Network:           os.Getenv("VCD_NETWORK"),
 					IPAllocationMode:  os.Getenv("VCD_NETWORK_ALLOCATION_MODE"),
 					Token:             os.Getenv("VCD_TOKEN"),
+					InstanceGroupName: "fleeting-test-user-password",
+					VAppNamePrefix:    os.Getenv("VCD_VAPP_NAME_PREFIX"),
 					Catalog:           os.Getenv("VCD_CATALOG"),
 					Template:          os.Getenv("VCD_TEMPLATE"),
-					CPUCount:          4,
-					MemoryMB:          8192,
-					VApp:              vAppName,
-					VMNamePrefix:      os.Getenv("VCD_VM_NAME_PREFIX"),
-					parsedURL:         parsedURL,
 					StorageProfile:    os.Getenv("VCD_STORAGE_PROFILE"),
+					CPUCount:          mustAtoi(os.Getenv("VCD_CPU_COUNT")),
+					CoresPerSocket:    mustAtoi(os.Getenv("VCD_CORES_PER_SOCKET")),
+					MemoryMB:          int64(mustAtoi(os.Getenv("VCD_MEMORY_MB"))),
+					DiskSizeGB:        mustAtoi(os.Getenv("VCD_DISK_SIZE_GB")),
 				},
 				// We need write some thing the Username field here. In reality, the username will be provided by ConnectInfo(),
 				// and as we use VCD+VMware Tools it is always either root or Administrator.
