@@ -25,6 +25,7 @@ Fleeting is an abstraction layer for cloud providers' instance groups, allowing 
 
 - The vApp template must have a single VM
 - The OS template must have VMware Tools (or open-vm-tools for Linux) installed
+- If using the Docker Autoscaler executor, the Docker daemon must be installed and running on the VM (including the Docker Hub mirror if needed)
 - For Windows machines, the OpenSSH service must be enabled (WinRM is not supported)
 
 ## Building the plugin
@@ -74,7 +75,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## History
 
 This plugin is based on:
+
 - My previous [Docker Machine driver for VCD](https://github.com/juanfont/docker-machine-driver-vcd)
 - The [Hetzner](https://gitlab.com/hetznercloud/fleeting-plugin-hetzner) plugin for Fleeting
 - Joe Burnett's [Fleeting explanation on YouTube](https://www.youtube.com/watch?v=niZ508K4dts)
-
