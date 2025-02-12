@@ -18,7 +18,7 @@ var _ provider.InstanceGroup = (*InstanceGroup)(nil)
 const (
 	// vcd does not implement any kind of instance group
 	// so we use a metadata tag to identify the VMs of this fleeting instance group
-	instanceGroupMetadataKey = "fleeting-plugin-vcd"
+	instanceGroupMetadataKey = "vcd-instance-group"
 )
 
 type InstanceGroup struct {
@@ -69,7 +69,7 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 
 	return provider.ProviderInfo{
 		ID:        path.Join("vcd", g.Org, g.VirtualDatacenter, g.Network, g.VAppNamePrefix, g.InstanceGroupName),
-		MaxSize:   128, // max number of VMs in a vApp
+		MaxSize:   128,
 		Version:   Version.Version,
 		BuildInfo: Version.BuildInfo(),
 	}, nil
@@ -79,7 +79,7 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
 	fmt.Println("Increasing")
 	added := 0
 	for i := 1; i <= delta; i++ {
-		go g.createVM()
+		go g.createInstance()
 		added++
 		g.log.Debug("added VM to vApp")
 	}
@@ -94,11 +94,11 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) ([]str
 	}
 
 	deletedVMs := []string{}
-	for _, id := range instances {
-		if err := g.deleteVApp(id); err != nil {
-			g.log.Error("deleting VM", "id", id, "error", err)
+	for _, instanceID := range instances {
+		if err := g.deleteInstance(instanceID); err != nil {
+			g.log.Error("deleting VM", "id", instanceID, "error", err)
 		} else {
-			deletedVMs = append(deletedVMs, id)
+			deletedVMs = append(deletedVMs, instanceID)
 		}
 	}
 
@@ -113,7 +113,7 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 		return err
 	}
 
-	vapps, err := g.getVappsInInstanceGroup()
+	vapps, err := g.getInstancesInInstanceGroup()
 	if err != nil {
 		g.log.Error("error getting vapps in instance group", "error", err)
 		return fmt.Errorf("getting vapps in instance group: %w", err)
@@ -222,7 +222,7 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 }
 
 func (g *InstanceGroup) Shutdown(ctx context.Context) error {
-	vapps, err := g.getVappsInInstanceGroup()
+	vapps, err := g.getInstancesInInstanceGroup()
 	if err != nil {
 		return fmt.Errorf("getting vapps in instance group: %w", err)
 	}
@@ -233,7 +233,7 @@ func (g *InstanceGroup) Shutdown(ctx context.Context) error {
 			continue
 		}
 		g.log.Info("Shutting down. Deleting vApp", "vApp", vapp.VApp.HREF)
-		err = g.deleteVApp(vapp.VApp.HREF)
+		err = g.deleteInstance(vapp.VApp.HREF)
 		if err != nil {
 			g.log.Error("error deleting vApp", "vApp", vapp.VApp.HREF, "error", err)
 		}

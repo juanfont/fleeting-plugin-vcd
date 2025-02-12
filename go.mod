@@ -1,12 +1,17 @@
 module github.com/juanfont/fleeting-plugin-vcd
 
-go 1.22.0
+go 1.23
+
+toolchain go1.23.5
 
 require (
+	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/hashicorp/go-hclog v1.6.3
+	github.com/puzpuzpuz/xsync/v3 v3.5.0
 	github.com/stretchr/testify v1.9.0
 	github.com/vmware/go-vcloud-director/v2 v2.26.0
 	gitlab.com/gitlab-org/fleeting/fleeting v0.0.0-20240911165028-a0ce7d6c3260
+	golang.org/x/crypto v0.28.0
 )
 
 require (
@@ -43,7 +48,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.13.1 // indirect
 	github.com/tidwall/transform v0.0.0-20201103190739-32f242e2dbde // indirect
-	golang.org/x/crypto v0.28.0 // indirect
 	golang.org/x/exp v0.0.0-20241004190924-225e2abe05e6 // indirect
 	golang.org/x/mod v0.21.0 // indirect
 	golang.org/x/net v0.30.0 // indirect
