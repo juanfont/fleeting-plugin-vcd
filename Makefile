@@ -11,3 +11,6 @@ test-integration:
 		exit 1; \
 	fi
 	go test -v -timeout 3600s -count=1 ./... -run $(test)
+
+test-integration-all:
+	go test -v -timeout 3600s -count=1 ./...
