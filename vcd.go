@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	"github.com/vmware/go-vcloud-director/v2/govcd"
-	"github.com/vmware/go-vcloud-director/v2/types/v56"
+	"github.com/vmware/go-vcloud-director/v3/govcd"
+	"github.com/vmware/go-vcloud-director/v3/types/v56"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -28,6 +28,8 @@ const (
 	deleteInstanceTimeout        = 20 * time.Minute
 	refreshBackoffMaxInterval    = 1 * time.Minute
 	refreshBackoffMaxElapsedTime = 10 * time.Minute
+
+	vcdAPIVersion = "38.1"
 )
 
 func (g *InstanceGroup) createInstance() (*govcd.VApp, *govcd.VM, error) {
@@ -620,7 +622,7 @@ func newClient(apiURL url.URL, org string, token string, insecure bool) (*govcd.
 	client := &govcd.VCDClient{
 		Client: govcd.Client{
 			VCDHREF:    apiURL,
-			APIVersion: "37.3",
+			APIVersion: vcdAPIVersion,
 			Http: http.Client{
 				Transport: &http.Transport{
 					TLSClientConfig: &tls.Config{

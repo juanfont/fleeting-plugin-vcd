@@ -8,8 +8,8 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-hclog"
-	"github.com/vmware/go-vcloud-director/v2/govcd"
-	"github.com/vmware/go-vcloud-director/v2/types/v56"
+	"github.com/vmware/go-vcloud-director/v3/govcd"
+	"github.com/vmware/go-vcloud-director/v3/types/v56"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
 
@@ -164,7 +164,13 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 			g.log.Info("unexpected instance status", "id", vm.VM.HREF, "name", vm.VM.Name, "status", vm.VM.Status, "statusName", types.VAppStatuses[vm.VM.Status])
 			if vm.VM.Tasks != nil {
 				for _, t := range vm.VM.Tasks.Task {
-					g.log.Debug("task", "id", t.ID, "status", t.Status, "name", t.Name, "operation", t.Operation, "vm", vm.VM.Name, "vApp", vapp.VApp.Name)
+					g.log.Debug("vm task", "id", t.ID, "status", t.Status, "name", t.Name, "operation", t.Operation, "vm", vm.VM.Name, "vApp", vapp.VApp.Name)
+				}
+			}
+
+			if vapp.VApp.Tasks != nil {
+				for _, t := range vapp.VApp.Tasks.Task {
+					g.log.Debug("vapp task", "id", t.ID, "status", t.Status, "name", t.Name, "operation", t.Operation, "vApp", vapp.VApp.Name)
 				}
 			}
 

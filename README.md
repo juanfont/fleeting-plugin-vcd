@@ -47,7 +47,7 @@ The plugin requires several environment variables to be set:
 - `VCD_VDC`: Virtual Data Center name
 - `VCD_NETWORK`: Network name
 - `VCD_NETWORK_ALLOCATION_MODE`: IP allocation mode (DHCP or POOL)
-- `VCD_TOKEN`: API token (VCD 10.4+ required)
+- `VCD_TOKEN`: API token (VCD 10.5.1+ required)
 - `VCD_CATALOG`: Catalog name containing the VM template
 - `VCD_TEMPLATE`: VM template name
 - `VCD_VAPP_NAME_PREFIX`: Prefix for created vApps
