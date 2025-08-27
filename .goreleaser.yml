@@ -1,5 +1,6 @@
 # This is an example .goreleaser.yml file with some sane defaults.
 # Make sure to check the documentation at http://goreleaser.com
+version: 2
 before:
   hooks:
     - go mod tidy
@@ -7,6 +8,7 @@ builds:
   - id: linux-amd64
     env:
       - CGO_ENABLED=1
+    main: ./cmd/fleeting-plugin-vcd/main.go
     goos:
       - linux
     goarch:
@@ -14,17 +16,14 @@ builds:
     mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
-  - id: golang-cross
-    builds:
+  - ids:
       - linux-amd64
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format: binary
+    formats: ["binary"]
     # wrap_in_directory: true
 
 checksum:
   name_template: "checksums.txt"
-snapshot:
-  name_template: "{{ .Tag }}-next"
 changelog:
   sort: asc
   filters:
