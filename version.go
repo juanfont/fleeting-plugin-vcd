@@ -1,11 +1,9 @@
 package vcd
 
 import (
-	"fmt"
 	"log"
 	"runtime/debug"
 
-	"github.com/davecgh/go-spew/spew"
 	"gitlab.com/gitlab-org/fleeting/fleeting/plugin"
 )
 
@@ -25,8 +23,6 @@ func init() {
 		log.Fatal("failed to read build info")
 	}
 
-	spew.Dump(buildInfo)
-
 	Version = plugin.VersionInfo{
 		Name:      NAME,
 		Version:   buildInfo.Main.Version,
@@ -34,7 +30,4 @@ func init() {
 		Reference: buildInfo.Main.Path,
 		BuiltAt:   buildInfo.Settings[0].Key,
 	}
-
-	fmt.Println(Version.String())
-	fmt.Println(Version.BuildInfo())
 }

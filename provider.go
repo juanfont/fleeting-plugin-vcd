@@ -227,6 +227,15 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 	return info, nil
 }
 
+// Heartbeat is typical called by the taskscaler before the taskscaler does connect to the instance.
+// This is a temporary implementation. Will be properly implemented in a future update.
+// TODO: Implement check related to VM health state and/or check if the VM received a preemption notice
+//
+// HINT: Too many API calls should be avoided, as ConnectInfo is called subsequently.
+func (g *InstanceGroup) Heartbeat(ctx context.Context, id string) error {
+	return nil
+}
+
 func (g *InstanceGroup) Shutdown(ctx context.Context) error {
 	vapps, err := g.getInstancesInInstanceGroup()
 	if err != nil {
