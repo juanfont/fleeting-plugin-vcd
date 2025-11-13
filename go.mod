@@ -1,15 +1,17 @@
 module github.com/juanfont/fleeting-plugin-vcd
 
-go 1.24.0
+go 1.25.4
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/gorilla/mux v1.8.1
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/puzpuzpuz/xsync/v3 v3.5.1
+	github.com/puzpuzpuz/xsync/v4 v4.2.0
 	github.com/stretchr/testify v1.11.1
 	github.com/vmware/go-vcloud-director/v3 v3.0.0
-	gitlab.com/gitlab-org/fleeting/fleeting v0.0.0-20250813150340-82a2c0debfe3
-	golang.org/x/crypto v0.41.0
+	gitlab.com/gitlab-org/fleeting/fleeting v0.0.0-20250910083154-db769f38ab21
+	golang.org/x/crypto v0.44.0
 )
 
 require (
@@ -55,13 +57,13 @@ require (
 	github.com/tidwall/transform v0.0.0-20201103190739-32f242e2dbde // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	gitlab.com/gitlab-org/go/reopen v1.0.0 // indirect
-	gitlab.com/gitlab-org/labkit v1.25.0 // indirect
+	gitlab.com/gitlab-org/labkit v1.28.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/exp v0.0.0-20250819193227-8b4c13bb791b // indirect
-	golang.org/x/mod v0.27.0 // indirect
-	golang.org/x/net v0.43.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/mod v0.29.0 // indirect
+	golang.org/x/net v0.46.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250826171959-ef028d996bc1 // indirect
 	google.golang.org/grpc v1.75.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect

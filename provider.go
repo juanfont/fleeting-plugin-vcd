@@ -2,7 +2,9 @@ package vcd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"path"
 	"strings"
@@ -15,14 +17,22 @@ import (
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
 
+var (
+	errInstanceNotFound    = errors.New("instance not found")
+	errInstancePreexisting = errors.New("instance is preexisting")
+)
+
 const (
 	// vcd does not implement any kind of instance group
 	// so we use a metadata tag to identify the VMs of this fleeting instance group
 	instanceGroupMetadataKey = "vcd-instance-group"
+	maxSize                  = 128
+	debugServerAddr          = "0.0.0.0:27060"
 )
 
 type InstanceGroup struct {
-	Name string `json:"name"`
+	Name      string           `json:"name"`
+	vcdClient *govcd.VCDClient `json:"-"`
 
 	// Cloud Director connection config
 	StrURL            string `json:"url"`
@@ -47,7 +57,10 @@ type InstanceGroup struct {
 
 	log hclog.Logger
 
-	settings provider.Settings
+	settings     provider.Settings
+	stateManager *instanceStateManager
+	debugServer  *DebugServer
+	httpServer   *http.Server
 }
 
 // Init implements provider.InstanceGroup
@@ -67,9 +80,26 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 		return provider.ProviderInfo{}, fmt.Errorf("dynamic credentials are not supported yet")
 	}
 
+	g.stateManager = newInstanceStateManager(g.log)
+
+	// Initialize debug server
+	g.debugServer = NewDebugServer(g.log, g.stateManager, g.InstanceGroupName)
+	g.httpServer = &http.Server{
+		Addr:    debugServerAddr,
+		Handler: g.debugServer,
+	}
+
+	// Start HTTP server in a goroutine
+	go func() {
+		g.log.Info("Starting debug HTTP server", "addr", debugServerAddr)
+		if err := g.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			g.log.Error("Debug HTTP server failed", "error", err)
+		}
+	}()
+
 	return provider.ProviderInfo{
 		ID:        path.Join("vcd", g.Org, g.VirtualDatacenter, g.Network, g.VAppNamePrefix, g.InstanceGroupName),
-		MaxSize:   128,
+		MaxSize:   maxSize,
 		Version:   Version.Version,
 		BuildInfo: Version.BuildInfo(),
 	}, nil
@@ -88,18 +118,15 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
 }
 
 // Decrease implements provider.InstanceGroup
-func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) ([]string, error) {
-	if len(instances) == 0 {
+func (g *InstanceGroup) Decrease(ctx context.Context, instancesToDelete []string) ([]string, error) {
+	g.log.Info("Decreasing the number of instances", "instancesToDelete", instancesToDelete)
+	if len(instancesToDelete) == 0 {
 		return nil, nil
 	}
 
 	deletedVMs := []string{}
-	for _, instanceID := range instances {
-		if err := g.deleteInstance(instanceID); err != nil {
-			g.log.Error("deleting VM", "id", instanceID, "error", err)
-		} else {
-			deletedVMs = append(deletedVMs, instanceID)
-		}
+	for _, instanceID := range instancesToDelete {
+		go g.deleteInstance(instanceID)
 	}
 
 	return deletedVMs, nil
@@ -107,9 +134,10 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) ([]str
 
 // Update implements provider.InstanceGroup
 func (g *InstanceGroup) Update(ctx context.Context, update func(instance string, state provider.State)) error {
-	g.log.Debug("Updating instance group")
-	client, err := newClient(*g.parsedURL, g.Org, g.Token, false)
+	g.log.Info("Updating instance group state")
+	client, err := g.getVCDClient()
 	if err != nil {
+		g.log.Error("error creating VCD client", "error", err)
 		return err
 	}
 
@@ -119,24 +147,30 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 		return fmt.Errorf("getting vapps in instance group: %w", err)
 	}
 
-	g.log.Debug("found vapps", "number", len(vapps))
+	g.log.Info("Found vapps", "number", len(vapps))
 
 	size := 0
 	for _, vapp := range vapps {
-		g.log.Debug("Checking status of vapp", "vApp", vapp.VApp.Name)
-		if len(vapp.VApp.Children.VM) == 0 {
-			g.log.Debug("vapp has no VMs", "vApp", vapp.VApp.HREF)
+		g.log.Info("Checking status of vapp", "vApp", vapp.VApp.Name)
+		if vapp.VApp.Children == nil || len(vapp.VApp.Children.VM) == 0 {
+			g.log.Warn("vapp has no VMs", "vApp", vapp.VApp.HREF)
 			continue
 		}
 
-		g.log.Debug("refreshing vapp", "vApp", vapp.VApp.Name)
+		g.log.Info("refreshing vapp", "vApp", vapp.VApp.Name)
 		err := vapp.Refresh()
 		if err != nil {
 			g.log.Error("error refreshing vapp", "vApp", vapp.VApp.Name, "error", err)
 			continue
 		}
 
-		g.log.Debug("refreshing VM", "vApp", vapp.VApp.HREF)
+		// Check again after refresh - state might have changed
+		if vapp.VApp.Children == nil || len(vapp.VApp.Children.VM) == 0 {
+			g.log.Warn("vapp has no VMs after refresh", "vApp", vapp.VApp.HREF)
+			continue
+		}
+
+		g.log.Info("refreshing VM", "vApp", vapp.VApp.HREF)
 		vmHREF := vapp.VApp.Children.VM[0].HREF
 		vm := govcd.NewVM(&client.Client)
 		vm.VM.HREF = vmHREF
@@ -148,34 +182,23 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 
 		size++
 
-		var state provider.State
-		switch types.VAppStatuses[vm.VM.Status] {
-		// The lifecycle in VCD is:
-		// - Deploying UNRESOLVED -> POWERED_OFF -> PARTIALLY_POWERED_OFF -> POWERED_ON
-		// - Deleting POWERED_ON -> PARTIALLY_POWERED_OFF -> POWERED_OFF -> DELETING -> UNKNOWN
-		case "UNRESOLVED", "PARTIALLY_POWERED_OFF":
-			state = provider.StateCreating
-		case "POWERED_ON":
-			state = provider.StateRunning
-		case "UNKNOWN":
-			state = provider.StateDeleting
-
-		default:
-			g.log.Info("unexpected instance status", "id", vm.VM.HREF, "name", vm.VM.Name, "status", vm.VM.Status, "statusName", types.VAppStatuses[vm.VM.Status])
-			if vm.VM.Tasks != nil {
-				for _, t := range vm.VM.Tasks.Task {
-					g.log.Debug("vm task", "id", t.ID, "status", t.Status, "name", t.Name, "operation", t.Operation, "vm", vm.VM.Name, "vApp", vapp.VApp.Name)
-				}
-			}
-
-			if vapp.VApp.Tasks != nil {
-				for _, t := range vapp.VApp.Tasks.Task {
-					g.log.Debug("vapp task", "id", t.ID, "status", t.Status, "name", t.Name, "operation", t.Operation, "vApp", vapp.VApp.Name)
-				}
-			}
-
-			// TODO(juanfont): Check for failed signs and handle then. E.g., there is a task in the VM task list that shows failed
+		ipAddress, err := getPrimaryIPAddress(vm)
+		if err != nil {
+			g.log.Error("error getting primary IP address", "vApp", vapp.VApp.HREF, "error", err)
+			continue
 		}
+
+		// We update our state manager first, just in case this is a pre-existing instance.
+		g.stateManager.Update(vapp.VApp.HREF, func(data instanceData) instanceData {
+			data.VAppName = vapp.VApp.Name
+			data.VMName = vapp.VApp.Children.VM[0].Name
+			data.VAppStatus = types.VAppStatuses[vapp.VApp.Status]
+			data.VMStatus = types.VAppStatuses[vapp.VApp.Children.VM[0].Status]
+			data.IPAddress = ipAddress
+			return data
+		})
+
+		_, state := g.stateManager.GetFleetingState(vapp.VApp.HREF)
 
 		// we update the state of the VM, but we use the vApp href as id
 		// so it is easier to find the vApp in the API response
@@ -188,6 +211,16 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 
 // ConnectInfo implements provider.InstanceGroup
 func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.ConnectInfo, error) {
+	found, data := g.stateManager.Get(id)
+	if !found {
+		return provider.ConnectInfo{}, errInstanceNotFound
+	}
+
+	if data.CreatedAt == nil {
+		// Instruct Fleeting to kill the instance, as it is preexisting
+		return provider.ConnectInfo{}, errInstancePreexisting
+	}
+
 	info := provider.ConnectInfo{
 		ConnectorConfig: g.settings.ConnectorConfig,
 	}
@@ -209,16 +242,12 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 
 	info.Protocol = provider.ProtocolSSH
 
-	// We assume that the vApp has only one VM with only one NIC
-	if vm.VM.NetworkConnectionSection != nil {
-		networks := vm.VM.NetworkConnectionSection.NetworkConnection
-		for _, n := range networks {
-			if n.IPAddress != "" {
-				info.InternalAddr = n.IPAddress
-				info.ExternalAddr = n.IPAddress
-			}
-		}
+	ipAddress, err := getPrimaryIPAddress(vm)
+	if err != nil {
+		return info, err
 	}
+	info.InternalAddr = ipAddress
+	info.ExternalAddr = ipAddress
 
 	if info.ExternalAddr == "" {
 		return info, fmt.Errorf("no external address found for VM %s", id)
@@ -228,15 +257,32 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 }
 
 // Heartbeat is typical called by the taskscaler before the taskscaler does connect to the instance.
-// This is a temporary implementation. Will be properly implemented in a future update.
-// TODO: Implement check related to VM health state and/or check if the VM received a preemption notice
-//
-// HINT: Too many API calls should be avoided, as ConnectInfo is called subsequently.
 func (g *InstanceGroup) Heartbeat(ctx context.Context, id string) error {
+	found, data := g.stateManager.Get(id)
+	if !found {
+		g.log.Warn("instance not found. this can happen when the instance is not fetched yet on start-up.", "id", id)
+		return nil
+	}
+
+	if data.CreatedAt == nil {
+		// Instruct Fleeting to kill the instance, as it is preexisting
+		return errInstancePreexisting
+	}
+
 	return nil
 }
 
 func (g *InstanceGroup) Shutdown(ctx context.Context) error {
+	g.log.Info("Shutting down the instance group")
+
+	// Shutdown HTTP server first
+	if g.httpServer != nil {
+		g.log.Info("Shutting down debug HTTP server")
+		if err := g.httpServer.Shutdown(ctx); err != nil {
+			g.log.Error("Error shutting down debug HTTP server", "error", err)
+		}
+	}
+
 	vapps, err := g.getInstancesInInstanceGroup()
 	if err != nil {
 		return fmt.Errorf("getting vapps in instance group: %w", err)
