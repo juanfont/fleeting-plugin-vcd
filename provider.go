@@ -13,6 +13,7 @@ import (
 	"github.com/vmware/go-vcloud-director/v3/govcd"
 	"github.com/vmware/go-vcloud-director/v3/types/v56"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
+	"golang.org/x/sync/semaphore"
 )
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
@@ -28,6 +29,7 @@ const (
 	instanceGroupMetadataKey = "vcd-instance-group"
 	maxSize                  = 128
 	debugServerAddr          = "0.0.0.0:27060"
+	maxConcurrentDeletions   = 5 // Limit concurrent deletion operations
 )
 
 type InstanceGroup struct {
@@ -61,6 +63,7 @@ type InstanceGroup struct {
 	stateManager *instanceStateManager
 	debugServer  *DebugServer
 	httpServer   *http.Server
+	deletionSem  *semaphore.Weighted // Limits concurrent deletions
 }
 
 // Init implements provider.InstanceGroup
@@ -81,6 +84,9 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 	}
 
 	g.stateManager = newInstanceStateManager(g.log)
+
+	// Initialize deletion semaphore to limit concurrent API calls
+	g.deletionSem = semaphore.NewWeighted(maxConcurrentDeletions)
 
 	// Initialize debug server
 	g.debugServer = NewDebugServer(g.log, g.stateManager, g.InstanceGroupName)
@@ -124,12 +130,27 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instancesToDelete []string
 		return nil, nil
 	}
 
-	deletedVMs := []string{}
+	// Launch deletions in goroutines with semaphore to limit concurrency
 	for _, instanceID := range instancesToDelete {
-		go g.deleteInstance(instanceID)
+		go func() {
+			// Acquire semaphore (blocks if max concurrent deletions reached)
+			if err := g.deletionSem.Acquire(context.Background(), 1); err != nil {
+				g.log.Error("failed to acquire deletion semaphore", "id", instanceID, "error", err)
+				return
+			}
+			defer g.deletionSem.Release(1)
+
+			// Perform deletion
+			if err := g.deleteInstance(instanceID); err != nil {
+				g.log.Error("deleting VM", "id", instanceID, "error", err)
+			} else {
+				g.log.Info("successfully deleted VM", "id", instanceID)
+			}
+		}()
 	}
 
-	return deletedVMs, nil
+	// Return immediately - deletions happen in background
+	return instancesToDelete, nil
 }
 
 // Update implements provider.InstanceGroup
@@ -147,17 +168,15 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 		return fmt.Errorf("getting vapps in instance group: %w", err)
 	}
 
-	g.log.Info("Found vapps", "number", len(vapps))
-
 	size := 0
 	for _, vapp := range vapps {
-		g.log.Info("Checking status of vapp", "vApp", vapp.VApp.Name)
+		g.log.Debug("Checking status of vapp", "vApp", vapp.VApp.Name)
 		if vapp.VApp.Children == nil || len(vapp.VApp.Children.VM) == 0 {
 			g.log.Warn("vapp has no VMs", "vApp", vapp.VApp.HREF)
 			continue
 		}
 
-		g.log.Info("refreshing vapp", "vApp", vapp.VApp.Name)
+		g.log.Debug("refreshing vapp", "vApp", vapp.VApp.Name)
 		err := vapp.Refresh()
 		if err != nil {
 			g.log.Error("error refreshing vapp", "vApp", vapp.VApp.Name, "error", err)
@@ -170,7 +189,7 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 			continue
 		}
 
-		g.log.Info("refreshing VM", "vApp", vapp.VApp.HREF)
+		g.log.Debug("refreshing VM", "vApp", vapp.VApp.HREF)
 		vmHREF := vapp.VApp.Children.VM[0].HREF
 		vm := govcd.NewVM(&client.Client)
 		vm.VM.HREF = vmHREF

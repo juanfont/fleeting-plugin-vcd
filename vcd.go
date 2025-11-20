@@ -41,7 +41,15 @@ type trustedPlatformModuleEdit struct {
 	TpmPresent bool     `xml:"root:TpmPresent"`
 }
 
-func (g *InstanceGroup) createInstance() (*govcd.VApp, *govcd.VM, error) {
+func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err error) {
+	// Recover from panics in VCD library
+	defer func() {
+		if r := recover(); r != nil {
+			g.log.Error("Panic recovered in createInstance", "panic", r)
+			err = fmt.Errorf("panic in createInstance: %v", r)
+		}
+	}()
+
 	client, err := g.getVCDClient()
 	if err != nil {
 		return nil, nil, err
@@ -99,7 +107,7 @@ func (g *InstanceGroup) createInstance() (*govcd.VApp, *govcd.VM, error) {
 		return nil, nil, err
 	}
 
-	vapp, err := vdc.GetVAppByName(vAppName, true)
+	vapp, err = vdc.GetVAppByName(vAppName, true)
 	if err != nil {
 		g.log.Error("error getting vapp", "error", err)
 		return nil, nil, err
@@ -128,15 +136,29 @@ func (g *InstanceGroup) createInstance() (*govcd.VApp, *govcd.VM, error) {
 		}
 	})
 
-	vm, err := waitForVMCreation(client, vapp)
+	vm, err = waitForVMCreation(client, vapp)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	g.log.Debug("VM is ready", "vm", vm.VM.Name)
 
-	err = vapp.AddMetadataEntry(types.MetadataStringValue, instanceGroupMetadataKey, g.InstanceGroupName)
+	// Refresh vApp before adding metadata to ensure it's fully loaded
+	err = vapp.Refresh()
 	if err != nil {
+		g.log.Error("error refreshing vApp before adding metadata", "error", err)
+		return nil, nil, err
+	}
+
+	err = vapp.AddMetadataEntryWithVisibility(
+		instanceGroupMetadataKey,
+		g.InstanceGroupName,
+		types.MetadataStringValue,
+		types.MetadataReadWriteVisibility,
+		false, // isSystem
+	)
+	if err != nil {
+		g.log.Error("error adding metadata to vApp", "error", err)
 		return nil, nil, err
 	}
 
@@ -184,7 +206,11 @@ func (g *InstanceGroup) createInstance() (*govcd.VApp, *govcd.VM, error) {
 		return nil, nil, err
 	}
 
-	g.log.Debug("powering on vm", "vm", vm.VM.Name)
+	err = vm.Refresh()
+	if err != nil {
+		return nil, nil, err
+	}
+
 	ipAddress, err := getPrimaryIPAddress(vm)
 	if err != nil {
 		return nil, nil, err
