@@ -1,0 +1,96 @@
+concurrent = 1
+check_interval = 0
+shutdown_timeout = 0
+
+[session_server]
+session_timeout = 1800
+
+[[runners]]
+token_expires_at = "0001-01-01T00:00:00Z"
+
+name = "vionta-linux-docker-autoscaler-0"
+url = "https://gitlab.com"
+id = 9819
+token = "fooooooobarr"
+token_obtained_at = 2024-11-01T09:59:16Z
+executor = "docker-autoscaler"
+
+[runners.docker]
+image = "ubuntu:24.04"
+
+[runners.autoscaler]
+plugin = "fleeting-plugin-vcd"
+
+update_interval = "1m"
+update_interval_when_expecting = "5s"
+
+
+capacity_per_instance = 1
+max_instances = 5
+max_use_count = 2
+
+
+[runners.autoscaler.plugin_config]
+# Unique name for this runner instance
+name = "runner-autoscaler0"
+
+# VMware Cloud Director API endpoint
+url = "https://vcd.local/api"
+
+# VCD Organization name
+org = "VcdOrg"
+
+# WARNING: Store sensitive credentials securely (use environment variables or secrets management)
+# API token for authentication (requires VCD 10.4+)
+token = "fooooooobarr"
+
+# Virtual Datacenter within the organization
+virtual_datacenter = "orgvdc"
+
+# Network to attach VMs to
+network = "orgvdc-network"
+
+# IP allocation mode: "POOL" (from predefined pool) or "DHCP"
+ip_allocation_mode = "POOL"
+
+# Metadata tag to identify VMs belonging to this instance group
+# This is used internally to filter and manage VMs
+instance_group_name = "autoscaler-linux-0"
+
+# Prefix for vApp names created by this instance group
+# Can be same as instance_group_name or different for organizational purposes
+vapp_name_prefix = "vapp-linux-docker-0"
+
+# VCD Catalog containing the VM template
+catalog = "vcd-catalog"
+
+# Template name within the catalog
+template = "Debian_12"
+
+# Storage profile to use for VM disks
+storage_profile = "vcd-storage-profile"
+
+# CPU configuration
+cpu_count = 2
+cores_per_socket = 2
+
+# Memory in MB
+memory_mb = 4096
+
+# Disk size in GB (optional - omit or set to 0 to use template default)
+disk_size_gb = 130
+
+# Debug HTTP server address (optional - leave empty to disable)
+# Provides web interface showing instance states at http://[address]/
+# Use "127.0.0.1:27060" for localhost only (recommended), or "0.0.0.0:27060" for all interfaces
+debug_server_addr = "127.0.0.1:27060"
+
+[runners.autoscaler.connector_config]
+use_static_credentials = true
+username = "root"
+password = "Password123!"
+timeout = 1800000000000
+
+[[runners.autoscaler.policy]]
+idle_count = 2
+idle_time = "20m0s"
