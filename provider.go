@@ -28,7 +28,6 @@ const (
 	// so we use a metadata tag to identify the VMs of this fleeting instance group
 	instanceGroupMetadataKey = "vcd-instance-group"
 	maxSize                  = 128
-	debugServerAddr          = "0.0.0.0:27060"
 	maxConcurrentDeletions   = 5 // Limit concurrent deletion operations
 )
 
@@ -52,6 +51,7 @@ type InstanceGroup struct {
 	CoresPerSocket    int    `json:"cores_per_socket"`
 	MemoryMB          int64  `json:"memory_mb"`
 	DiskSizeGB        int    `json:"disk_size_gb"`
+	DebugServerAddr   string `json:"debug_server_addr"` // Address for debug HTTP server (empty to disable)
 
 	size int
 
@@ -88,20 +88,24 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 	// Initialize deletion semaphore to limit concurrent API calls
 	g.deletionSem = semaphore.NewWeighted(maxConcurrentDeletions)
 
-	// Initialize debug server
-	g.debugServer = NewDebugServer(g.log, g.stateManager, g.InstanceGroupName)
-	g.httpServer = &http.Server{
-		Addr:    debugServerAddr,
-		Handler: g.debugServer,
-	}
-
-	// Start HTTP server in a goroutine
-	go func() {
-		g.log.Info("Starting debug HTTP server", "addr", debugServerAddr)
-		if err := g.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			g.log.Error("Debug HTTP server failed", "error", err)
+	// Initialize debug server if address is configured
+	if g.DebugServerAddr != "" {
+		g.debugServer = NewDebugServer(g.log, g.stateManager, g.InstanceGroupName)
+		g.httpServer = &http.Server{
+			Addr:    g.DebugServerAddr,
+			Handler: g.debugServer,
 		}
-	}()
+
+		// Start HTTP server in a goroutine
+		go func() {
+			g.log.Info("Starting debug HTTP server", "addr", g.DebugServerAddr)
+			if err := g.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				g.log.Error("Debug HTTP server failed", "error", err)
+			}
+		}()
+	} else {
+		g.log.Debug("Debug HTTP server disabled (no address configured)")
+	}
 
 	return provider.ProviderInfo{
 		ID:        path.Join("vcd", g.Org, g.VirtualDatacenter, g.Network, g.VAppNamePrefix, g.InstanceGroupName),
