@@ -128,6 +128,7 @@ func (ds *DebugServer) handleInstancesTable(w http.ResponseWriter, r *http.Reque
                 <th>Booting At</th>
                 <th>Booted At</th>
                 <th>Deleting At</th>
+				<th>Garbage Collected At</th>
                 <th>Deleted At</th>
             </tr>
         </thead>
@@ -147,7 +148,8 @@ func (ds *DebugServer) handleInstancesTable(w http.ResponseWriter, r *http.Reque
 				<td>{{if .BootingAt}}{{.BootingAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
                 <td>{{if .BootedAt}}{{.BootedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
                 <td>{{if .DeletingAt}}{{.DeletingAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .DeletedAt}}{{.DeletedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+				<td>{{if .GarbageCollectedAt}}{{.GarbageCollectedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+				<td>{{if .DeletedAt}}{{.DeletedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
             </tr>
             {{else}}
             <tr>
