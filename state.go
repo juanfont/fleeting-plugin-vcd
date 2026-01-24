@@ -27,12 +27,13 @@ type instanceData struct {
 	// A basic state machine to track the lifecycle of the instance
 	// Using *time.Time allows us to track when state transitions occur
 	// nil means the state has never been reached
-	CreatedAt   *time.Time
-	BootingAt   *time.Time
-	BootedAt    *time.Time
-	DeletingAt  *time.Time // When deletion process starts
-	DeletedAt   *time.Time // When deletion is complete (soft delete marker)
-	LastUpdated *time.Time // When this instance data was last modified
+	CreatedAt          *time.Time
+	BootingAt          *time.Time
+	BootedAt           *time.Time
+	DeletingAt         *time.Time // When deletion process starts
+	GarbageCollectedAt *time.Time // When garbage collection process starts
+	DeletedAt          *time.Time // When deletion is complete (soft delete marker)
+	LastUpdated        *time.Time // When this instance data was last modified
 }
 
 func newInstanceStateManager(log hclog.Logger) *instanceStateManager {

@@ -24,13 +24,18 @@ var (
 	errUnexpectedNumberOfVMs      = errors.New("unexpected number of VMs in template")
 	errDiskSectionNotFound        = errors.New("disk section not found")
 	errCouldNotExecuteTaskRequest = errors.New("could not execute task request")
-	errPanicInVCDLibrary          = errors.New("panic in VCD library")
 )
 
 const (
-	deleteInstanceTimeout        = 20 * time.Minute
+	deleteInstanceTimeout        = 60 * time.Minute
 	refreshBackoffMaxInterval    = 1 * time.Minute
-	refreshBackoffMaxElapsedTime = 10 * time.Minute
+	refreshBackoffMaxElapsedTime = 20 * time.Minute
+
+	// vcd does not implement any kind of instance group, and it tends
+	// to have hiccups with the API, so we need to garbage collect the instances
+	// periodically that failed to be deployed, or failed to be deleted.
+	instanceGarbageCollectionInterval = 1 * time.Hour
+	maxVAppAgeBeforeGC                = 24 * time.Hour
 
 	vcdAPIVersion = "38.1"
 )
@@ -43,9 +48,10 @@ type trustedPlatformModuleEdit struct {
 
 func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err error) {
 	// Recover from panics in VCD library
+	vAPPHREF := ""
 	defer func() {
 		if r := recover(); r != nil {
-			g.log.Error("Panic recovered in createInstance", "panic", r)
+			g.log.Error("Panic recovered in createInstance", "panic", r, "vapp_href", vAPPHREF)
 			err = fmt.Errorf("panic in createInstance: %v", r)
 		}
 	}()
@@ -99,31 +105,47 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 		true)
 	if err != nil {
 		g.log.Error("error creating vapp", "error", err)
+		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
 	if err = task.WaitTaskCompletion(); err != nil {
 		g.log.Error("error waiting for task completion", "error", err)
+		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
 	vapp, err = vdc.GetVAppByName(vAppName, true)
 	if err != nil {
-		g.log.Error("error getting vapp", "error", err)
+		g.log.Error("error getting vapp", "error", err, vAppName)
+		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
+	vAPPHREF = vapp.VApp.HREF
+
 	if len(vapp.VApp.Children.VM) != 1 {
-		g.log.Error("expected 1 VM, got %d", len(vapp.VApp.Children.VM))
+		g.log.Error(
+			"vapp has unexpected number of VMs",
+			"vapp_href", vapp.VApp.HREF,
+			"vapp", vapp.VApp.Name,
+			"expected 1 VM, got %d", len(vapp.VApp.Children.VM))
+		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, errUnexpectedNumberOfVMs
 	}
 
-	g.log.Debug("waiting for VM to be fully created",
+	g.log.Info("waiting for VM to be fully created",
 		"vapp_href", vapp.VApp.HREF,
 		"vapp", vapp.VApp.Name,
 		"vm_href", vapp.VApp.Children.VM[0].HREF,
 		"vm", vapp.VApp.Children.VM[0].Name,
 	)
+
+	vm, err = waitForVMCreation(client, vapp)
+	if err != nil {
+		go g.cleanUpInstanceByName(vAppName)
+		return nil, nil, err
+	}
 
 	g.stateManager.Update(vapp.VApp.HREF, func(data instanceData) instanceData {
 		return instanceData{
@@ -136,17 +158,22 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 		}
 	})
 
-	vm, err = waitForVMCreation(client, vapp)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	g.log.Debug("VM is ready", "vm", vm.VM.Name)
+	g.log.Info("VM is created",
+		"vm", vm.VM.Name, "vm_href", vm.VM.HREF,
+		"vapp_href", vapp.VApp.HREF,
+		"vapp", vapp.VApp.Name,
+	)
 
 	// Refresh vApp before adding metadata to ensure it's fully loaded
 	err = vapp.Refresh()
 	if err != nil {
-		g.log.Error("error refreshing vApp before adding metadata", "error", err)
+		g.log.Error(
+			"error refreshing vApp before adding metadata",
+			"error", err,
+			"vapp_href", vapp.VApp.HREF,
+			"vapp", vapp.VApp.Name,
+		)
+		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
@@ -158,11 +185,19 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 		false, // isSystem
 	)
 	if err != nil {
-		g.log.Error("error adding metadata to vApp", "error", err)
+		g.log.Error(
+			"error adding metadata to vApp",
+			"error", err,
+			"vapp_href", vapp.VApp.HREF,
+			"vapp", vapp.VApp.Name,
+			"metadata_key", instanceGroupMetadataKey,
+			"metadata_value", g.InstanceGroupName,
+		)
+		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
-	g.log.Debug("injecting credentials", "vm", vm.VM.Name)
+	g.log.Info("injecting credentials", "vm", vm.VM.Name)
 
 	err = g.injectCredentials(vm)
 	if err != nil {
@@ -191,15 +226,32 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 	// 	return nil, err
 	// }
 
+	g.log.Info(
+		"changing CPU and core count", "vm", vm.VM.Name,
+		"vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
+		"cpu_count", g.CPUCount, "cores_per_socket", g.CoresPerSocket,
+	)
+
 	err = vm.ChangeCPUAndCoreCount(&g.CPUCount, &g.CoresPerSocket)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	g.log.Info(
+		"changing memory", "vm", vm.VM.Name, "vapp_href",
+		vapp.VApp.HREF, "vapp", vapp.VApp.Name,
+		"memory_mb", g.MemoryMB,
+	)
+
 	err = vm.ChangeMemory(g.MemoryMB)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	g.log.Info(
+		"changing disk size", "vm", vm.VM.Name, "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
+		"disk_size_gb", g.DiskSizeGB,
+	)
 
 	vm, err = g.changeDiskSize(vm)
 	if err != nil {
@@ -213,6 +265,13 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 
 	ipAddress, err := getPrimaryIPAddress(vm)
 	if err != nil {
+		g.log.Error("error getting primary IP address while creating instance. Deleting instance.",
+			"vApp", vapp.VApp.HREF,
+			"vAppName", vapp.VApp.Name,
+			"vmName", vm.VM.Name,
+			"error", err)
+
+		go g.deleteInstance(vapp.VApp.HREF)
 		return nil, nil, err
 	}
 
@@ -226,6 +285,9 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 
 	task, err = vm.PowerOn()
 	if err != nil {
+		g.log.Error("error powering on VM", "error", err,
+			"vm", vm.VM.Name, "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
+		)
 		return nil, nil, err
 	}
 
@@ -268,27 +330,32 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 }
 
 func (g *InstanceGroup) getInstancesInInstanceGroup() (vApps []*govcd.VApp, err error) {
-	// Recover from panics in VCD library (known issue with SearchByFilter)
+	// Recover from panics in VCD library (known issue with SearchByFilter).
+	// Return empty list instead of error to avoid killing the taskscaler.
 	defer func() {
 		if r := recover(); r != nil {
-			g.log.Error("Panic recovered in getInstancesInInstanceGroup", "panic", r)
-			err = errPanicInVCDLibrary
+			g.log.Error("Panic recovered in getInstancesInInstanceGroup (returning empty list)", "panic", r)
+			vApps = []*govcd.VApp{}
+			err = nil
 		}
 	}()
 
 	client, err := g.getVCDClient()
 	if err != nil {
-		return nil, fmt.Errorf("error creating client: %w", err)
+		g.log.Error("error creating VCD client (returning empty list)", "error", err)
+		return []*govcd.VApp{}, nil
 	}
 
 	org, err := client.GetOrgByName(g.Org)
 	if err != nil {
-		return nil, fmt.Errorf("error getting org: %w", err)
+		g.log.Error("error getting org (returning empty list)", "error", err)
+		return []*govcd.VApp{}, nil
 	}
 
 	vdc, err := org.GetVDCByName(g.VirtualDatacenter, true)
 	if err != nil {
-		return nil, fmt.Errorf("error getting VDC: %w", err)
+		g.log.Error("error getting VDC (returning empty list)", "error", err)
+		return []*govcd.VApp{}, nil
 	}
 
 	criteria := &govcd.FilterDef{
@@ -308,17 +375,22 @@ func (g *InstanceGroup) getInstancesInInstanceGroup() (vApps []*govcd.VApp, err 
 
 	results, _, err := client.Client.SearchByFilter(types.QtVapp, criteria)
 	if err != nil {
-		g.log.Error("error searching for vapps", "error", err)
-		return nil, err
+		// Don't propagate SearchByFilter errors to the taskscaler.
+		// Returning an error here causes the taskscaler to stop reconciling
+		// this runner group entirely, which is catastrophic.
+		// Instead, return an empty list and let the next reconcile retry.
+		g.log.Error("error searching for vapps (returning empty list to avoid taskscaler death)", "error", err)
+		return []*govcd.VApp{}, nil
 	}
 
 	vApps = []*govcd.VApp{}
 	for _, result := range results {
 		vApp, err := vdc.GetVAppByHref(result.GetHref())
 		if err != nil {
-			g.log.Warn("error getting vApp",
+			g.log.Warn("error getting vApp. pruning from state manager",
 				"name", result.GetName(),
 				"href", result.GetHref(), "error", err)
+			g.stateManager.Prune(result.GetHref())
 			continue
 		}
 
@@ -328,8 +400,87 @@ func (g *InstanceGroup) getInstancesInInstanceGroup() (vApps []*govcd.VApp, err 
 	return vApps, nil
 }
 
+func (g *InstanceGroup) runGarbageCollection() error {
+	g.log.Info("starting garbage collection")
+	ticker := time.NewTicker(instanceGarbageCollectionInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			ctx := context.Background()
+			deleted, err := g.garbageCollectInstances(ctx)
+			if err != nil {
+				g.log.Error("error garbage collecting instances", "error", err)
+			}
+			g.log.Info("garbage collected instances", "deleted", deleted)
+		}
+	}
+}
+
+func (g *InstanceGroup) garbageCollectInstances(ctx context.Context) (int, error) {
+	g.log.Info("garbage collecting instances")
+	vapps, err := g.getInstancesInInstanceGroup()
+	if err != nil {
+		return 0, fmt.Errorf("error getting instances in instance group: %w", err)
+	}
+
+	deleted := 0
+	for _, vapp := range vapps {
+		if vapp.VApp.Children == nil || len(vapp.VApp.Children.VM) != 1 {
+			g.log.Warn("vapp has no VMs", "vApp", vapp.VApp.HREF)
+		}
+
+		dateCreated, err := time.Parse("2006-01-02T15:04:05.000Z", vapp.VApp.DateCreated)
+		if err != nil {
+			g.log.Warn("could not parse DateCreated for vapp", "vApp", vapp.VApp.HREF, "dateCreated", vapp.VApp.DateCreated, "error", err)
+			continue
+		}
+
+		if dateCreated.Add(maxVAppAgeBeforeGC).Before(time.Now()) {
+			g.log.Info("garbage collecting vapp", "vApp", vapp.VApp.HREF)
+			g.stateManager.Update(vapp.VApp.HREF, func(data instanceData) instanceData {
+				data.GarbageCollectedAt = now()
+				return data
+			})
+			err = g.deleteInstance(vapp.VApp.HREF)
+			if err != nil {
+				g.log.Error("error deleting vapp", "vApp", vapp.VApp.HREF, "error", err)
+			}
+			deleted++
+			continue
+		}
+	}
+
+	return deleted, nil
+}
+
+func (g *InstanceGroup) cleanUpInstanceByName(name string) error {
+	client, err := g.getVCDClient()
+	if err != nil {
+		return err
+	}
+
+	org, err := client.GetOrgByName(g.Org)
+	if err != nil {
+		return err
+	}
+
+	vdc, err := org.GetVDCByName(g.VirtualDatacenter, true)
+	if err != nil {
+		return err
+	}
+
+	vapp, err := vdc.GetVAppByName(name, true)
+	if err != nil {
+		return err
+	}
+
+	return g.deleteInstance(vapp.VApp.HREF)
+}
+
 // deleteInstance deletes a vApp and its VM. Because it can
 func (g *InstanceGroup) deleteInstance(href string) error {
+	g.log.Info("deleting instance", "href", href)
 	// Mark deletion as started
 	g.stateManager.Update(href, func(data instanceData) instanceData {
 		if data.DeletingAt == nil {
@@ -365,12 +516,14 @@ func (g *InstanceGroup) deleteInstance(href string) error {
 		),
 	)
 	if err != nil {
+		g.log.Error("error refreshing vapp", "href", href, "error", err)
 		return err
 	}
 
 	g.log.Debug("deleting vapp", "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name)
 
 	if vapp.VApp.Children == nil || len(vapp.VApp.Children.VM) != 1 {
+		g.log.Error("vapp has unexpected number of VMs on delete", "href", href, "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name, "expected 1 VM, got", len(vapp.VApp.Children.VM))
 		return errUnexpectedNumberOfVMs
 	}
 
@@ -378,6 +531,9 @@ func (g *InstanceGroup) deleteInstance(href string) error {
 	vm.VM.HREF = vapp.VApp.Children.VM[0].HREF
 	err = vm.Refresh()
 	if err != nil {
+		g.log.Error("error refreshing vm for deletion",
+			"vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
+			"href", href, "vm_href", vm.VM.HREF, "vm", vm.VM.Name, "error", err)
 		return err
 	}
 
@@ -418,7 +574,17 @@ func (g *InstanceGroup) deleteInstance(href string) error {
 
 	task, err = vapp.Delete()
 	if err != nil {
-		return err
+		// Sometimes VCD is just not cooperating. So we need to retry.
+		g.log.Error("error deleting vapp", "href", href, "error", err)
+
+		// FUCK THIS SHIT. FUCK VCD. FUCK THE WHOLE THING.
+		time.Sleep(60 * time.Second)
+
+		task, err = vapp.Delete()
+		if err != nil {
+			g.log.Error("error deleting vapp", "href", href, "error", err)
+			return err
+		}
 	}
 
 	err = task.WaitTaskCompletion()

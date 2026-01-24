@@ -107,6 +107,8 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 		g.log.Debug("Debug HTTP server disabled (no address configured)")
 	}
 
+	go g.runGarbageCollection()
+
 	return provider.ProviderInfo{
 		ID:        path.Join("vcd", g.Org, g.VirtualDatacenter, g.Network, g.VAppNamePrefix, g.InstanceGroupName),
 		MaxSize:   maxSize,
@@ -172,15 +174,17 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 		return fmt.Errorf("getting vapps in instance group: %w", err)
 	}
 
+	g.log.Info("found vapps in instance group", "vapps", len(vapps))
+
 	size := 0
 	for _, vapp := range vapps {
-		g.log.Debug("Checking status of vapp", "vApp", vapp.VApp.Name)
+		g.log.Info("Checking status of vapp", "vApp", vapp.VApp.Name)
 		if vapp.VApp.Children == nil || len(vapp.VApp.Children.VM) == 0 {
 			g.log.Warn("vapp has no VMs", "vApp", vapp.VApp.HREF)
 			continue
 		}
 
-		g.log.Debug("refreshing vapp", "vApp", vapp.VApp.Name)
+		g.log.Info("refreshing vapp", "vApp", vapp.VApp.Name)
 		err := vapp.Refresh()
 		if err != nil {
 			g.log.Error("error refreshing vapp", "vApp", vapp.VApp.Name, "error", err)
@@ -207,7 +211,8 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 
 		ipAddress, err := getPrimaryIPAddress(vm)
 		if err != nil {
-			g.log.Error("error getting primary IP address", "vApp", vapp.VApp.HREF, "error", err)
+			g.log.Error("error getting primary IP address",
+				"vApp", vapp.VApp.HREF, "error", err, "vm", vapp.VApp.Children.VM[0].Name)
 			continue
 		}
 
