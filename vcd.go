@@ -47,12 +47,25 @@ type trustedPlatformModuleEdit struct {
 }
 
 func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err error) {
-	// Recover from panics in VCD library
-	vAPPHREF := ""
+	var vAppName string
+	var completed bool
+
+	// Combined defer: panic recovery + cleanup on failure
+	// This ensures cleanup happens for ALL failure modes: errors, panics, early returns
 	defer func() {
+		// First, recover from any panics
 		if r := recover(); r != nil {
-			g.log.Error("Panic recovered in createInstance", "panic", r, "vapp_href", vAPPHREF)
+			g.log.Error("Panic recovered in createInstance", "panic", r, "vapp_name", vAppName)
 			err = fmt.Errorf("panic in createInstance: %v", r)
+		}
+
+		// Then, clean up if creation didn't complete successfully
+		if !completed && vAppName != "" {
+			g.log.Warn("createInstance did not complete successfully, cleaning up",
+				"vapp_name", vAppName,
+				"error", err,
+			)
+			go g.cleanUpInstanceByName(vAppName)
 		}
 	}()
 
@@ -88,7 +101,7 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 		return nil, nil, err
 	}
 
-	vAppName, err := generateVMName(g.VAppNamePrefix)
+	vAppName, err = generateVMName(g.VAppNamePrefix)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -105,32 +118,27 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 		true)
 	if err != nil {
 		g.log.Error("error creating vapp", "error", err)
-		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
 	if err = task.WaitTaskCompletion(); err != nil {
 		g.log.Error("error waiting for task completion", "error", err)
-		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
 	vapp, err = vdc.GetVAppByName(vAppName, true)
 	if err != nil {
-		g.log.Error("error getting vapp", "error", err, vAppName)
-		go g.cleanUpInstanceByName(vAppName)
+		g.log.Error("error getting vapp", "error", err, "vapp_name", vAppName)
 		return nil, nil, err
 	}
-
-	vAPPHREF = vapp.VApp.HREF
 
 	if len(vapp.VApp.Children.VM) != 1 {
 		g.log.Error(
 			"vapp has unexpected number of VMs",
 			"vapp_href", vapp.VApp.HREF,
 			"vapp", vapp.VApp.Name,
-			"expected 1 VM, got %d", len(vapp.VApp.Children.VM))
-		go g.cleanUpInstanceByName(vAppName)
+			"expected", 1,
+			"got", len(vapp.VApp.Children.VM))
 		return nil, nil, errUnexpectedNumberOfVMs
 	}
 
@@ -143,7 +151,6 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 
 	vm, err = waitForVMCreation(client, vapp)
 	if err != nil {
-		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
@@ -173,7 +180,6 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 			"vapp_href", vapp.VApp.HREF,
 			"vapp", vapp.VApp.Name,
 		)
-		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
@@ -193,7 +199,6 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 			"metadata_key", instanceGroupMetadataKey,
 			"metadata_value", g.InstanceGroupName,
 		)
-		go g.cleanUpInstanceByName(vAppName)
 		return nil, nil, err
 	}
 
@@ -258,20 +263,26 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 		return nil, nil, err
 	}
 
+	g.log.Info("disk size changed, refreshing VM",
+		"vm", vm.VM.Name, "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
+	)
+
 	err = vm.Refresh()
 	if err != nil {
 		return nil, nil, err
 	}
 
+	g.log.Info("getting primary IP address",
+		"vm", vm.VM.Name, "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
+	)
+
 	ipAddress, err := getPrimaryIPAddress(vm)
 	if err != nil {
-		g.log.Error("error getting primary IP address while creating instance. Deleting instance.",
-			"vApp", vapp.VApp.HREF,
-			"vAppName", vapp.VApp.Name,
-			"vmName", vm.VM.Name,
+		g.log.Error("error getting primary IP address while creating instance",
+			"vapp_href", vapp.VApp.HREF,
+			"vapp_name", vapp.VApp.Name,
+			"vm_name", vm.VM.Name,
 			"error", err)
-
-		go g.deleteInstance(vapp.VApp.HREF)
 		return nil, nil, err
 	}
 
@@ -282,6 +293,11 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 		data.IPAddress = ipAddress
 		return data
 	})
+
+	g.log.Info("powering on VM",
+		"vm", vm.VM.Name, "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
+		"ip_address", ipAddress,
+	)
 
 	task, err = vm.PowerOn()
 	if err != nil {
@@ -324,8 +340,14 @@ func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err er
 		return data
 	})
 
-	g.log.Debug("VM is powered on", "vm", vm.VM.Name)
+	g.log.Info("instance created successfully",
+		"vapp_name", vapp.VApp.Name,
+		"vapp_href", vapp.VApp.HREF,
+		"vm_name", vm.VM.Name,
+	)
 
+	// Mark creation as complete - this prevents the cleanup defer from running
+	completed = true
 	return vapp, vm, nil
 }
 
