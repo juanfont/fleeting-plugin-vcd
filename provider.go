@@ -83,7 +83,7 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 		return provider.ProviderInfo{}, fmt.Errorf("dynamic credentials are not supported yet")
 	}
 
-	g.stateManager = newInstanceStateManager(g.log)
+	g.stateManager = newInstanceStateManager(g.log, g.InstanceGroupName)
 
 	// Initialize deletion semaphore to limit concurrent API calls
 	g.deletionSem = semaphore.NewWeighted(maxConcurrentDeletions)
@@ -234,6 +234,13 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 	}
 
 	g.size = size
+
+	// Update pool metrics
+	PoolSize.WithLabelValues(g.InstanceGroupName).Set(float64(size))
+
+	// Update state manager metrics
+	g.stateManager.UpdateMetrics(g.InstanceGroupName)
+
 	return nil
 }
 

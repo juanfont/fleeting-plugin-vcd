@@ -8,6 +8,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/hashicorp/go-hclog"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type DebugServer struct {
@@ -32,6 +33,7 @@ func NewDebugServer(log hclog.Logger, stateManager *instanceStateManager, instan
 func (ds *DebugServer) setupRoutes() {
 	ds.router.HandleFunc("/", ds.handleInstancesTable).Methods("GET")
 	ds.router.HandleFunc("/instances", ds.handleInstancesTable).Methods("GET")
+	ds.router.Handle("/metrics", promhttp.Handler()).Methods("GET")
 }
 
 func (ds *DebugServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {

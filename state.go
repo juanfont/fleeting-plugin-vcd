@@ -9,8 +9,9 @@ import (
 )
 
 type instanceStateManager struct {
-	log   hclog.Logger
-	state *xsync.Map[string, instanceData]
+	log               hclog.Logger
+	state             *xsync.Map[string, instanceData]
+	instanceGroupName string
 }
 
 type instanceData struct {
@@ -36,11 +37,12 @@ type instanceData struct {
 	LastUpdated        *time.Time // When this instance data was last modified
 }
 
-func newInstanceStateManager(log hclog.Logger) *instanceStateManager {
+func newInstanceStateManager(log hclog.Logger, instanceGroupName string) *instanceStateManager {
 	state := xsync.NewMap[string, instanceData]()
 	return &instanceStateManager{
-		log:   log,
-		state: state,
+		log:               log,
+		state:             state,
+		instanceGroupName: instanceGroupName,
 	}
 }
 
@@ -48,19 +50,24 @@ func (m *instanceStateManager) Get(id string) (bool, instanceData) {
 	m.log.Info("[InstanceStateManager] getting instance data", "id", id)
 	data, ok := m.state.Load(id)
 	if !ok {
+		StateManagerGetsTotal.WithLabelValues(m.instanceGroupName, "false").Inc()
 		return false, instanceData{}
 	}
 
 	// Don't return soft-deleted instances
 	if data.DeletedAt != nil {
 		m.log.Debug("[InstanceStateManager] instance is soft-deleted", "id", id, "deletedAt", data.DeletedAt)
+		StateManagerGetsTotal.WithLabelValues(m.instanceGroupName, "false").Inc()
 		return false, instanceData{}
 	}
 
+	StateManagerGetsTotal.WithLabelValues(m.instanceGroupName, "true").Inc()
 	return true, data
 }
 
 func (m *instanceStateManager) Update(id string, fn func(instanceData) instanceData) instanceData {
+	StateManagerUpdatesTotal.WithLabelValues(m.instanceGroupName).Inc()
+
 	data, ok := m.state.Load(id)
 	if !ok {
 		m.log.Info("[InstanceStateManager] instance data not found", "id", id)
@@ -77,6 +84,7 @@ func (m *instanceStateManager) Update(id string, fn func(instanceData) instanceD
 }
 
 func (m *instanceStateManager) Prune(id string) {
+	StateManagerPrunesTotal.WithLabelValues(m.instanceGroupName).Inc()
 	m.log.Info("[InstanceStateManager] pruning instance data", "id", id)
 	m.state.Delete(id)
 }
@@ -115,6 +123,34 @@ func (m *instanceStateManager) GetFleetingState(id string) (bool, provider.State
 	}
 
 	return true, state
+}
+
+// UpdateMetrics updates all state manager Prometheus gauges
+func (m *instanceStateManager) UpdateMetrics(instanceGroupName string) {
+	counts := map[string]int{
+		string(provider.StateCreating): 0,
+		string(provider.StateRunning):  0,
+		string(provider.StateDeleting): 0,
+		string(provider.StateDeleted):  0,
+	}
+	preexisting := 0
+	total := 0
+
+	m.state.Range(func(key string, value instanceData) bool {
+		total++
+		_, state := m.GetFleetingState(key)
+		counts[string(state)]++
+		if value.CreatedAt == nil {
+			preexisting++
+		}
+		return true
+	})
+
+	StateManagerInstancesTotal.WithLabelValues(instanceGroupName).Set(float64(total))
+	StateManagerInstancesPreexisting.WithLabelValues(instanceGroupName).Set(float64(preexisting))
+	for state, count := range counts {
+		StateManagerInstancesByState.WithLabelValues(instanceGroupName, state).Set(float64(count))
+	}
 }
 
 // Helper function to get current time pointer

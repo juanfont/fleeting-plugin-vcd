@@ -6,6 +6,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/gorilla/mux v1.8.1
 	github.com/hashicorp/go-hclog v1.6.3
+	github.com/prometheus/client_golang v1.23.2
 	github.com/puzpuzpuz/xsync/v3 v3.5.1
 	github.com/puzpuzpuz/xsync/v4 v4.2.0
 	github.com/stretchr/testify v1.11.1
@@ -19,8 +20,10 @@ require (
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358 // indirect
 	github.com/ChrisTrenkamp/goxpath v0.0.0-20210404020558-97928f7e12b6 // indirect
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de // indirect
+	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bodgit/ntlmssp v0.0.0-20240506230425-31973bb52d9b // indirect
 	github.com/bodgit/windows v1.0.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
@@ -48,10 +51,14 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/oklog/run v1.2.0 // indirect
 	github.com/oklog/ulid/v2 v2.0.2 // indirect
 	github.com/peterhellberg/link v1.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/prometheus/client_model v0.6.2 // indirect
+	github.com/prometheus/common v0.66.1 // indirect
+	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/sebest/xff v0.0.0-20210106013422-671bd2870b3a // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect

@@ -49,14 +49,24 @@ type trustedPlatformModuleEdit struct {
 func (g *InstanceGroup) createInstance() (vapp *govcd.VApp, vm *govcd.VM, err error) {
 	var vAppName string
 	var completed bool
+	startTime := time.Now()
 
-	// Combined defer: panic recovery + cleanup on failure
+	// Combined defer: panic recovery + cleanup on failure + metrics
 	// This ensures cleanup happens for ALL failure modes: errors, panics, early returns
 	defer func() {
 		// First, recover from any panics
 		if r := recover(); r != nil {
 			g.log.Error("Panic recovered in createInstance", "panic", r, "vapp_name", vAppName)
 			err = fmt.Errorf("panic in createInstance: %v", r)
+		}
+
+		// Record metrics
+		duration := time.Since(startTime).Seconds()
+		InstanceCreationDuration.WithLabelValues(g.InstanceGroupName).Observe(duration)
+		if completed {
+			InstancesCreatedTotal.WithLabelValues(g.InstanceGroupName).Inc()
+		} else {
+			InstancesFailedTotal.WithLabelValues(g.InstanceGroupName, "create").Inc()
 		}
 
 		// Then, clean up if creation didn't complete successfully
@@ -440,6 +450,14 @@ func (g *InstanceGroup) runGarbageCollection() error {
 }
 
 func (g *InstanceGroup) garbageCollectInstances(ctx context.Context) (int, error) {
+	startTime := time.Now()
+	GCRunsTotal.WithLabelValues(g.InstanceGroupName).Inc()
+
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		GCDuration.WithLabelValues(g.InstanceGroupName).Observe(duration)
+	}()
+
 	g.log.Info("garbage collecting instances")
 	vapps, err := g.getInstancesInInstanceGroup()
 	if err != nil {
@@ -469,6 +487,7 @@ func (g *InstanceGroup) garbageCollectInstances(ctx context.Context) (int, error
 				g.log.Error("error deleting vapp", "vApp", vapp.VApp.HREF, "error", err)
 			}
 			deleted++
+			GCInstancesCollectedTotal.WithLabelValues(g.InstanceGroupName).Inc()
 			continue
 		}
 	}
@@ -501,7 +520,19 @@ func (g *InstanceGroup) cleanUpInstanceByName(name string) error {
 }
 
 // deleteInstance deletes a vApp and its VM. Because it can
-func (g *InstanceGroup) deleteInstance(href string) error {
+func (g *InstanceGroup) deleteInstance(href string) (err error) {
+	startTime := time.Now()
+
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		InstanceDeletionDuration.WithLabelValues(g.InstanceGroupName).Observe(duration)
+		if err == nil {
+			InstancesDeletedTotal.WithLabelValues(g.InstanceGroupName).Inc()
+		} else {
+			InstancesFailedTotal.WithLabelValues(g.InstanceGroupName, "delete").Inc()
+		}
+	}()
+
 	g.log.Info("deleting instance", "href", href)
 	// Mark deletion as started
 	g.stateManager.Update(href, func(data instanceData) instanceData {
