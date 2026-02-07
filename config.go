@@ -109,5 +109,12 @@ func (g *InstanceGroup) populate() error {
 
 	g.parsedURL = parsedURL
 
+	if g.MaxConcurrentCreates <= 0 {
+		g.MaxConcurrentCreates = defaultMaxConcurrentCreates
+	}
+	if g.MaxConcurrentDeletes <= 0 {
+		g.MaxConcurrentDeletes = defaultMaxConcurrentDeletes
+	}
+
 	return nil
 }
