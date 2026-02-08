@@ -105,16 +105,13 @@ func TestBasicCloudDirector(t *testing.T) {
 		require.NoError(t, err)
 
 		// Create a new VM
-		vapp, vm, err := ig.createInstance()
+		result, err := ig.createInstance()
 		require.NoError(t, err)
-		require.NotNil(t, vm)
-		require.NotNil(t, vapp)
+		require.NotNil(t, result)
+		require.NotEmpty(t, result.VAppHREF)
 
 		// Delete the VM
-		err = vm.Refresh()
-		require.NoError(t, err)
-
-		err = ig.deleteInstance(vapp.VApp.HREF)
+		err = ig.deleteInstance(result.VAppHREF)
 		require.NoError(t, err)
 	})
 
@@ -157,6 +154,17 @@ func TestBasicCloudDirector(t *testing.T) {
 
 		err = ig.validate()
 		require.NoError(t, err)
+
+		// Initialize store and reconciler (needed for Increase/Update)
+		ig.store = newDesiredStateStore(ig.log, ig.InstanceGroupName)
+		reconciler := newVCDInstanceGroup(ig.log, ig.store, ig, ReconcilerConfig{})
+		reconciler.Start()
+		ig.ig = reconciler
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), instanceGroupTestTimeout)
+			defer cancel()
+			reconciler.Shutdown(ctx)
+		}()
 
 		num, err := ig.Increase(context.Background(), 1)
 
@@ -290,12 +298,11 @@ func TestProvisioning(t *testing.T) {
 					MemoryMB:          int64(mustAtoi(os.Getenv("VCD_MEMORY_MB"))),
 					DiskSizeGB:        mustAtoi(os.Getenv("VCD_DISK_SIZE_GB")),
 				},
-				// We need write something the Username field here. In reality, the username will be provided by ConnectInfo(),
-				// and as we use VCD+VMware Tools it is always either root or Administrator.
 				ConnectorConfig: provider.ConnectorConfig{
 					Timeout:              30 * time.Minute,
 					UseStaticCredentials: true,
 					Username:             "root",
+					Password:             "ExcellentPassword123!",
 					Key:                  privateKeyPem,
 				},
 				MaxInstances:    3,
@@ -329,8 +336,6 @@ func TestProvisioning(t *testing.T) {
 					MemoryMB:          int64(mustAtoi(os.Getenv("VCD_MEMORY_MB"))),
 					DiskSizeGB:        mustAtoi(os.Getenv("VCD_DISK_SIZE_GB")),
 				},
-				// We need write some thing the Username field here. In reality, the username will be provided by ConnectInfo(),
-				// and as we use VCD+VMware Tools it is always either root or Administrator.
 				ConnectorConfig: provider.ConnectorConfig{
 					Timeout:              30 * time.Minute,
 					UseStaticCredentials: true,
@@ -342,6 +347,98 @@ func TestProvisioning(t *testing.T) {
 			},
 		)
 	})
+}
+
+func TestScaleLimits(t *testing.T) {
+	if os.Getenv("VCD_URL") == "" {
+		t.Skip("VCD_URL not set, skipping")
+	}
+
+	const targetSize = 2
+
+	instanceGroupName, err := generateVMName("test-scale-limits")
+	require.NoError(t, err)
+
+	ig := &InstanceGroup{
+		Name:              instanceGroupName,
+		StrURL:            os.Getenv("VCD_URL"),
+		Org:               os.Getenv("VCD_ORG"),
+		Token:             os.Getenv("VCD_TOKEN"),
+		VirtualDatacenter: os.Getenv("VCD_VDC"),
+		Network:           os.Getenv("VCD_NETWORK"),
+		IPAllocationMode:  os.Getenv("VCD_NETWORK_ALLOCATION_MODE"),
+		InstanceGroupName: instanceGroupName,
+		VAppNamePrefix:    os.Getenv("VCD_VAPP_NAME_PREFIX"),
+		Catalog:           os.Getenv("VCD_CATALOG"),
+		Template:          os.Getenv("VCD_TEMPLATE"),
+		StorageProfile:    os.Getenv("VCD_STORAGE_PROFILE"),
+		CPUCount:          1,
+		CoresPerSocket:    1,
+		MemoryMB:          512,
+		DiskSizeGB:        0, // use template default
+		log: hclog.New(&hclog.LoggerOptions{
+			Name:   "test",
+			Level:  hclog.Debug,
+			Output: os.Stdout,
+		}),
+
+		settings: provider.Settings{
+			ConnectorConfig: provider.ConnectorConfig{
+				UseStaticCredentials: true,
+				Password:             "ExcellentPassword123!",
+			},
+		},
+	}
+
+	err = ig.populate()
+	require.NoError(t, err)
+
+	err = ig.validate()
+	require.NoError(t, err)
+
+	ig.store = newDesiredStateStore(ig.log, ig.InstanceGroupName)
+	reconciler := newVCDInstanceGroup(ig.log, ig.store, ig, ReconcilerConfig{
+		MaxConcurrentCreates: 5,
+		MaxConcurrentDeletes: 10,
+	})
+	reconciler.Start()
+	ig.ig = reconciler
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), instanceGroupTestTimeout)
+		defer cancel()
+		reconciler.Shutdown(ctx)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), instanceGroupTestTimeout)
+	defer cancel()
+
+	// Request all at once
+	startTime := time.Now()
+	t.Logf("requesting %d instances", targetSize)
+	num, err := ig.Increase(ctx, targetSize)
+	require.NoError(t, err)
+	require.Equal(t, targetSize, num)
+
+	// Wait for all to be running
+	instanceIDs := waitForInstanceGroupSize(t, ctx, ig, targetSize)
+	require.NotNil(t, instanceIDs)
+	require.Equal(t, targetSize, len(instanceIDs))
+	createDuration := time.Since(startTime)
+	t.Logf("all %d instances running in %s", targetSize, createDuration)
+
+	// Delete all
+	startTime = time.Now()
+	deletedInstances, err := ig.Decrease(ctx, instanceIDs)
+	require.NoError(t, err)
+	require.Equal(t, targetSize, len(deletedInstances))
+
+	instanceIDs = waitForInstanceGroupSize(t, ctx, ig, 0)
+	require.NotNil(t, instanceIDs)
+	require.Equal(t, 0, len(instanceIDs))
+	deleteDuration := time.Since(startTime)
+	t.Logf("all %d instances deleted in %s", targetSize, deleteDuration)
+
+	t.Logf("SUMMARY: create=%s delete=%s total=%s", createDuration, deleteDuration, createDuration+deleteDuration)
 }
 
 func mustAtoi(s string) int {
