@@ -13,15 +13,15 @@ import (
 
 type DebugServer struct {
 	log               hclog.Logger
-	stateManager      *instanceStateManager
+	store             *desiredStateStore
 	router            *mux.Router
 	instanceGroupName string
 }
 
-func NewDebugServer(log hclog.Logger, stateManager *instanceStateManager, instanceGroupName string) *DebugServer {
+func NewDebugServer(log hclog.Logger, store *desiredStateStore, instanceGroupName string) *DebugServer {
 	ds := &DebugServer{
 		log:               log,
-		stateManager:      stateManager,
+		store:             store,
 		router:            mux.NewRouter(),
 		instanceGroupName: instanceGroupName,
 	}
@@ -43,41 +43,22 @@ func (ds *DebugServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (ds *DebugServer) handleInstancesTable(w http.ResponseWriter, r *http.Request) {
 	ds.log.Debug("Serving instances debug table")
 
-	// Collect all instances from the state manager (including soft-deleted ones)
-	instances := ds.stateManager.GetAll()
-
-	// Enhance instances with fleeting state information
-	type enhancedInstanceData struct {
-		instanceData
-		FleetingStateStr string
-	}
-
-	var enhancedInstances []enhancedInstanceData
-	for _, instance := range instances {
-		_, fleetingState := ds.stateManager.GetFleetingState(instance.InstanceID)
-		enhancedInstances = append(enhancedInstances, enhancedInstanceData{
-			instanceData:     instance,
-			FleetingStateStr: string(fleetingState),
-		})
-	}
+	instances := ds.store.GetAll()
 
 	// Sort by CreatedAt from newest to oldest
-	sort.Slice(enhancedInstances, func(i, j int) bool {
-		// Handle nil CreatedAt (preexisting instances) - put them at the end
-		if enhancedInstances[i].CreatedAt == nil && enhancedInstances[j].CreatedAt == nil {
-			return false // maintain original order for both nil
+	sort.Slice(instances, func(i, j int) bool {
+		if instances[i].CreatedAt == nil && instances[j].CreatedAt == nil {
+			return false
 		}
-		if enhancedInstances[i].CreatedAt == nil {
-			return false // i goes after j (nil goes to end)
+		if instances[i].CreatedAt == nil {
+			return false
 		}
-		if enhancedInstances[j].CreatedAt == nil {
-			return true // i goes before j (non-nil goes before nil)
+		if instances[j].CreatedAt == nil {
+			return true
 		}
-		// Both have CreatedAt, sort newest first
-		return enhancedInstances[i].CreatedAt.After(*enhancedInstances[j].CreatedAt)
+		return instances[i].CreatedAt.After(*instances[j].CreatedAt)
 	})
 
-	// HTML template for the table
 	tmpl := `
 <!DOCTYPE html>
 <html>
@@ -88,21 +69,23 @@ func (ds *DebugServer) handleInstancesTable(w http.ResponseWriter, r *http.Reque
         table { border-collapse: collapse; width: 100%; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         th { background-color: #f2f2f2; }
-        .status-true { color: green; font-weight: bold; }
-        .status-false { color: red; }
         .header { margin-bottom: 20px; }
         .refresh-info { margin-top: 20px; font-size: 0.9em; color: #666; }
         .deleted-row { background-color: #f8f9fa; opacity: 0.6; color: #6c757d; }
         .deleting-row { background-color: #f8d7da; }
+        .creating-row { background-color: #fff3cd; }
         .preexisting-row { background-color: #fff3e0; }
         .preexisting-yes { background-color: #ff9800; color: #ffffff; font-weight: bold; text-align: center; }
         .preexisting-no { color: #28a745; font-weight: bold; text-align: center; }
-        .fleeting-state { font-weight: bold; text-align: center; padding: 4px 8px; border-radius: 4px; }
-        .state-creating { background-color: #fff3cd; color: #856404; }
-        .state-running { background-color: #d4edda; color: #155724; }
-        .state-deleting { background-color: #f8d7da; color: #721c24; }
-        .state-deleted { background-color: #f8f9fa; color: #6c757d; }
-        .state-timeout { background-color: #f5c6cb; color: #721c24; }
+        .phase { font-weight: bold; text-align: center; padding: 4px 8px; border-radius: 4px; }
+        .phase-PendingCreate { background-color: #fff3cd; color: #856404; }
+        .phase-Creating { background-color: #cce5ff; color: #004085; }
+        .phase-Running { background-color: #d4edda; color: #155724; }
+        .phase-PendingDelete { background-color: #f8d7da; color: #721c24; }
+        .phase-Deleting { background-color: #f5c6cb; color: #721c24; }
+        .phase-Deleted { background-color: #f8f9fa; color: #6c757d; }
+        .retry-count { font-weight: bold; color: #dc3545; }
+        .error-text { color: #dc3545; font-size: 0.85em; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     </style>
     <meta http-equiv="refresh" content="5">
 </head>
@@ -113,54 +96,64 @@ func (ds *DebugServer) handleInstancesTable(w http.ResponseWriter, r *http.Reque
         <p>Total Instances: <b>{{len .Instances}}</b></p>
         <p>Last Updated: <b>{{.LastUpdated}}</b></p>
     </div>
-    
+
     <table>
         <thead>
             <tr>
-                <th>Instance ID</th>
+                <th>Intent ID</th>
+                <th>VApp HREF</th>
                 <th>Preexisting</th>
-                <th>Fleeting State</th>
+                <th>Phase</th>
                 <th>VApp Name</th>
                 <th>VM Name</th>
                 <th>VApp Status</th>
                 <th>VM Status</th>
                 <th>IP Address</th>
-                <th>Last Updated</th>
+                <th>Retries</th>
+                <th>Last Error</th>
+                <th>Next Retry</th>
                 <th>Created At</th>
-                <th>Booting At</th>
-                <th>Booted At</th>
-                <th>Deleting At</th>
-				<th>Garbage Collected At</th>
-                <th>Deleted At</th>
+                <th>Create Started</th>
+                <th>Create Completed</th>
+                <th>Delete Requested</th>
+                <th>Delete Started</th>
+                <th>Delete Completed</th>
+                <th>GC Marked</th>
+                <th>Last Updated</th>
             </tr>
         </thead>
         <tbody>
             {{range .Instances}}
-            <tr class="{{if .DeletedAt}}deleted-row{{else if .DeletingAt}}deleting-row{{else if not .CreatedAt}}preexisting-row{{end}}">
-                <td>{{.InstanceID}}</td>
+            <tr class="{{if eq .Phase.String "Deleted"}}deleted-row{{else if eq .Phase.String "Deleting"}}deleting-row{{else if eq .Phase.String "PendingDelete"}}deleting-row{{else if eq .Phase.String "Creating"}}creating-row{{else if eq .Phase.String "PendingCreate"}}creating-row{{else if not .CreatedAt}}preexisting-row{{end}}">
+                <td>{{.IntentID}}</td>
+                <td>{{.ID}}</td>
                 <td class="{{if not .CreatedAt}}preexisting-yes{{else}}preexisting-no{{end}}">{{if not .CreatedAt}}YES{{else}}NO{{end}}</td>
-                <td class="fleeting-state state-{{.FleetingStateStr}}">{{.FleetingStateStr}}</td>
-                <td>{{.VAppName}}</td>
+                <td class="phase phase-{{.Phase.String}}">{{.Phase.String}}</td>
+                <td>{{.Name}}</td>
                 <td>{{.VMName}}</td>
                 <td>{{.VAppStatus}}</td>
                 <td>{{.VMStatus}}</td>
                 <td>{{.IPAddress}}</td>
-                <td>{{if .LastUpdated}}{{.LastUpdated.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+                <td class="{{if gt .RetryCount 0}}retry-count{{end}}">{{.RetryCount}}</td>
+                <td class="error-text" title="{{.LastError}}">{{.LastError}}</td>
+                <td>{{if .NextRetryAfter}}{{.NextRetryAfter.Format "15:04:05"}}{{else}}-{{end}}</td>
                 <td>{{if .CreatedAt}}{{.CreatedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-				<td>{{if .BootingAt}}{{.BootingAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .BootedAt}}{{.BootedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .DeletingAt}}{{.DeletingAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-				<td>{{if .GarbageCollectedAt}}{{.GarbageCollectedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-				<td>{{if .DeletedAt}}{{.DeletedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+                <td>{{if .CreateStartedAt}}{{.CreateStartedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+                <td>{{if .CreateCompletedAt}}{{.CreateCompletedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+                <td>{{if .DeleteRequestedAt}}{{.DeleteRequestedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+                <td>{{if .DeleteStartedAt}}{{.DeleteStartedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+                <td>{{if .DeleteCompletedAt}}{{.DeleteCompletedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+                <td>{{if .GCMarkedAt}}{{.GCMarkedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
+                <td>{{if .LastUpdated}}{{.LastUpdated.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
             </tr>
             {{else}}
             <tr>
-                <td colspan="13" style="text-align: center; font-style: italic;">No instances found</td>
+                <td colspan="20" style="text-align: center; font-style: italic;">No instances found</td>
             </tr>
             {{end}}
         </tbody>
     </table>
-    
+
     <div class="refresh-info">
         <p>This page auto-refreshes every 5 seconds.</p>
     </div>
@@ -175,12 +168,12 @@ func (ds *DebugServer) handleInstancesTable(w http.ResponseWriter, r *http.Reque
 	}
 
 	data := struct {
-		Instances                []enhancedInstanceData
+		Instances                []Instance
 		InstanceGroupName        string
 		InstanceGroupMetadataKey string
 		LastUpdated              string
 	}{
-		Instances:                enhancedInstances,
+		Instances:                instances,
 		InstanceGroupName:        ds.instanceGroupName,
 		InstanceGroupMetadataKey: instanceGroupMetadataKey,
 		LastUpdated:              time.Now().Format("2006-01-02 15:04:05"),

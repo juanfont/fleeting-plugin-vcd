@@ -87,34 +87,26 @@ var (
 		Help: "Configured maximum pool size",
 	}, []string{instanceGroupLabel})
 
-	// State Manager Metrics
+	// State Manager Metrics (now backed by desiredStateStore)
 	StateManagerInstancesTotal = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "fleeting_vcd_state_manager_instances_total",
-		Help: "Total instances tracked in state manager",
+		Help: "Total instances tracked in state store",
 	}, []string{instanceGroupLabel})
 
 	StateManagerInstancesByState = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "fleeting_vcd_state_manager_instances_by_state",
-		Help: "Instances by fleeting state in state manager",
+		Help: "Instances by fleeting state in state store",
 	}, []string{instanceGroupLabel, "state"})
 
-	StateManagerInstancesPreexisting = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "fleeting_vcd_state_manager_instances_preexisting",
-		Help: "Preexisting instances (discovered, not created by us)",
+	// Reconciler Metrics
+	ReconcileDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "fleeting_vcd_reconcile_duration_seconds",
+		Help:    "Time taken for a single reconciliation cycle",
+		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120},
 	}, []string{instanceGroupLabel})
 
-	StateManagerUpdatesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "fleeting_vcd_state_manager_updates_total",
-		Help: "Total state manager update operations",
+	ReconcileTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fleeting_vcd_reconcile_total",
+		Help: "Total number of reconciliation cycles",
 	}, []string{instanceGroupLabel})
-
-	StateManagerPrunesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "fleeting_vcd_state_manager_prunes_total",
-		Help: "Total state manager prune operations",
-	}, []string{instanceGroupLabel})
-
-	StateManagerGetsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "fleeting_vcd_state_manager_gets_total",
-		Help: "Total state manager get operations",
-	}, []string{instanceGroupLabel, "found"})
 )
