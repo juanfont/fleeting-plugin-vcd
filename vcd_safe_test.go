@@ -177,3 +177,56 @@ func TestSafeVCDCall_ContextCancellation(t *testing.T) {
 	require.Error(t, err)
 	assert.Greater(t, int(calls.Load()), 0)
 }
+
+// --- Permanent error detection tests ---
+
+func TestIsPermanentError_StorageQuota(t *testing.T) {
+	err := errors.New("API Error: 400: exceed the VDC's storage quota")
+	assert.True(t, isPermanentError(err))
+}
+
+func TestIsPermanentError_EntityNotExist(t *testing.T) {
+	err := errors.New("entity does not exist")
+	assert.True(t, isPermanentError(err))
+}
+
+func TestIsPermanentError_UnableToPerform(t *testing.T) {
+	err := errors.New("[400:VALIDATION] - Unable to perform this action. Contact your cloud administrator.")
+	assert.True(t, isPermanentError(err))
+}
+
+func TestIsPermanentError_TransientError(t *testing.T) {
+	err := errors.New("connection refused")
+	assert.False(t, isPermanentError(err))
+}
+
+func TestIsPermanentError_Nil(t *testing.T) {
+	assert.False(t, isPermanentError(nil))
+}
+
+func TestSafeVCDCall_PermanentErrorNoRetry(t *testing.T) {
+	var calls atomic.Int32
+
+	_, err := safeVCDCall(context.Background(), testLogger(), "test", "permanent-op", func() (string, error) {
+		calls.Add(1)
+		return "", errors.New("exceed the VDC's storage quota")
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "storage quota")
+	// Should NOT retry — only 1 call
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestSafeVCDCall_PermanentErrorUnableToPerform(t *testing.T) {
+	var calls atomic.Int32
+
+	_, err := safeVCDCall(context.Background(), testLogger(), "test", "unable-op", func() (string, error) {
+		calls.Add(1)
+		return "", errors.New("Unable to perform this action. Contact your cloud administrator.")
+	})
+
+	require.Error(t, err)
+	// Should NOT retry — only 1 call
+	assert.Equal(t, int32(1), calls.Load())
+}
