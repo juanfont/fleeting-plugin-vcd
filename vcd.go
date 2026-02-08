@@ -524,12 +524,23 @@ func (g *InstanceGroup) deleteInstance(href string) (err error) {
 
 	vm := govcd.NewVM(&client.Client)
 	vm.VM.HREF = vapp.VApp.Children.VM[0].HREF
-	err = vm.Refresh()
+	err = safeVCDCallVoid(context.Background(), g.log, g.InstanceGroupName, "Refresh VM for delete", func() error {
+		return vm.Refresh()
+	})
 	if err != nil {
-		g.log.Error("error refreshing vm for deletion",
-			"vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
-			"href", href, "vm_href", vm.VM.HREF, "vm", vm.VM.Name, "error", err)
-		return err
+		if isEntityNotFoundError(err) {
+			g.log.Info("VM no longer exists, skipping VM-level cleanup", "href", href, "vm_href", vm.VM.HREF)
+		} else {
+			g.log.Error("error refreshing vm for deletion, skipping VM-level cleanup",
+				"vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
+				"href", href, "vm_href", vm.VM.HREF, "error", err)
+		}
+		// Fall through to delete the vApp directly — skip PowerOff/Undeploy since we can't refresh the VM
+		task, delErr := vapp.Delete()
+		if delErr != nil {
+			return delErr
+		}
+		return task.WaitTaskCompletion()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), deleteInstanceTimeout)

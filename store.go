@@ -343,19 +343,14 @@ func (s *desiredStateStore) UpdateMetrics() {
 		"Deleting":      0,
 		"Deleted":       0,
 	}
-	preexisting := 0
 	total := 0
 
 	for _, inst := range s.instances {
 		total++
 		counts[inst.Phase.String()]++
-		if inst.CreatedAt == nil {
-			preexisting++
-		}
 	}
 
 	StateManagerInstancesTotal.WithLabelValues(s.instanceGroupName).Set(float64(total))
-	StateManagerInstancesPreexisting.WithLabelValues(s.instanceGroupName).Set(float64(preexisting))
 
 	// Map to fleeting-compatible state names for backward compatibility
 	fleetingStateMap := map[string]string{

@@ -3,11 +3,33 @@ package vcd
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/hashicorp/go-hclog"
 )
+
+// permanentErrorPatterns are VCD error messages that should not be retried.
+// These indicate resource limits or configuration issues that won't resolve on retry.
+var permanentErrorPatterns = []string{
+	"exceed the VDC's storage quota",
+	"entity does not exist",
+	"Unable to perform this action",
+}
+
+func isPermanentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, pattern := range permanentErrorPatterns {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	return false
+}
 
 const (
 	safeCallMaxElapsedTime  = 5 * time.Minute
@@ -35,6 +57,9 @@ func safeVCDCall[T any](ctx context.Context, log hclog.Logger, instanceGroup str
 			val, opErr = fn()
 		}()
 
+		if isPermanentError(opErr) {
+			return val, backoff.Permanent(opErr)
+		}
 		return val, opErr
 	}
 

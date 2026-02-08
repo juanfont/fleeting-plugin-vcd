@@ -17,8 +17,7 @@ import (
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
 
 var (
-	errInstanceNotFound    = errors.New("instance not found")
-	errInstancePreexisting = errors.New("instance is preexisting")
+	errInstanceNotFound = errors.New("instance not found")
 )
 
 const (
@@ -165,12 +164,7 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 		case PhasePendingCreate, PhaseCreating:
 			state = provider.StateCreating
 		case PhaseRunning:
-			if inst.CreatedAt == nil {
-				// Preexisting instance — report as Running so fleeting can manage it
-				state = provider.StateRunning
-			} else {
-				state = provider.StateRunning
-			}
+			state = provider.StateRunning
 		case PhasePendingDelete, PhaseDeleting:
 			state = provider.StateDeleting
 		default:
@@ -190,10 +184,6 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 	inst, found := g.ig.Instance(id)
 	if !found {
 		return provider.ConnectInfo{}, errInstanceNotFound
-	}
-
-	if inst.CreatedAt == nil {
-		return provider.ConnectInfo{}, errInstancePreexisting
 	}
 
 	info := provider.ConnectInfo{
@@ -241,14 +231,10 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, id string) (provider.Co
 }
 
 func (g *InstanceGroup) Heartbeat(ctx context.Context, id string) error {
-	inst, found := g.ig.Instance(id)
+	_, found := g.ig.Instance(id)
 	if !found {
 		g.log.Warn("instance not found. this can happen when the instance is not fetched yet on start-up.", "id", id)
 		return nil
-	}
-
-	if inst.CreatedAt == nil {
-		return errInstancePreexisting
 	}
 
 	return nil

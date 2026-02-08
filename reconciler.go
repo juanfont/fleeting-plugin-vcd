@@ -28,6 +28,10 @@ const (
 	retryMaxDelay   = 5 * time.Minute
 	retryMultiplier = 2.0
 	retryJitter     = 0.25
+
+	// Circuit breaker: stop creating after N consecutive failures, cooldown before retrying
+	circuitBreakerThreshold = 3
+	circuitBreakerCooldown  = 5 * time.Minute
 )
 
 // ReconcilerConfig holds configuration for the reconciliation loop.
@@ -64,6 +68,16 @@ type vcdInstanceGroup struct {
 
 	createSem *semaphore.Weighted
 	deleteSem *semaphore.Weighted
+
+	// backgroundDeletes tracks HREFs with in-flight background delete goroutines
+	// (orphan/preexisting cleanup) to avoid firing duplicates on every poll.
+	backgroundDeletes sync.Map
+
+	// Circuit breaker: stop dispatching creates after consecutive failures.
+	cbMu                      sync.Mutex
+	consecutiveCreateFailures int
+	circuitBreakerUntil       time.Time
+	cbLoggedActive            bool // avoid log spam: only log once when active
 
 	triggerCh    chan struct{}
 	stopCh       chan struct{}
@@ -211,24 +225,20 @@ func (r *vcdInstanceGroup) pollVCD() {
 				osType = pollResult.OSType
 			}
 
-			// Update existing or add as preexisting.
-			// Skip AddPreexisting when there are in-flight creates, because the VApp
+			// Update existing instance, or auto-delete if not tracked.
+			// Skip deletion when there are in-flight creates, because the VApp
 			// is almost certainly from one of our create workers — not truly preexisting.
 			// It will be properly linked when doCreate calls UpdateInstance with the HREF.
 			if !r.store.UpdateFromVCD(href, vapp.VApp.Name, vmName, ipAddress, vappStatus, vmStatus, osType) {
 				if !r.store.HasCreating() {
-					r.store.AddPreexisting(href, vapp.VApp.Name, vmName, ipAddress, vappStatus, vmStatus, osType)
+					r.backgroundDelete(href, "preexisting vApp (leftover from previous run)")
 				}
 			}
 		} else {
 			// Empty vApp (in-flight creation or orphan) — update if tracked, but don't add as preexisting
 			vappStatus := types.VAppStatuses[vapp.VApp.Status]
 			if !r.store.UpdateFromVCD(href, vapp.VApp.Name, "", "", vappStatus, "", "") && !r.store.HasCreating() {
-				// Not tracked in store and no in-flight creates — this is an orphaned empty vApp
-				// (e.g. process crashed between CreateRawVApp and AddNewVMWithStorageProfile).
-				// Clean it up so it doesn't consume quota forever.
-				r.log.Warn("deleting orphaned empty vApp", "href", href, "name", vapp.VApp.Name)
-				go r.ig.deleteInstance(href)
+				r.backgroundDelete(href, "orphaned empty vApp")
 			}
 		}
 	}
@@ -249,7 +259,42 @@ type vmPollResult struct {
 	OSType string
 }
 
+// backgroundDelete fires a goroutine to delete a vApp that is not tracked in the store
+// (preexisting or orphaned). It deduplicates by HREF and recovers from panics.
+func (r *vcdInstanceGroup) backgroundDelete(href, reason string) {
+	if _, loaded := r.backgroundDeletes.LoadOrStore(href, true); loaded {
+		return // already in-flight
+	}
+
+	r.log.Warn("deleting "+reason, "href", href)
+	go func() {
+		defer r.backgroundDeletes.Delete(href)
+		defer func() {
+			if rec := recover(); rec != nil {
+				r.log.Error("panic in background delete", "href", href, "panic", rec)
+			}
+		}()
+
+		if err := r.ig.deleteInstance(href); err != nil {
+			r.log.Error("background delete failed", "href", href, "error", err)
+		}
+	}()
+}
+
 func (r *vcdInstanceGroup) dispatchCreates() {
+	r.cbMu.Lock()
+	if r.consecutiveCreateFailures >= circuitBreakerThreshold && time.Now().Before(r.circuitBreakerUntil) {
+		if !r.cbLoggedActive {
+			r.log.Warn("circuit breaker active, skipping creates",
+				"consecutive_failures", r.consecutiveCreateFailures,
+				"resume_at", r.circuitBreakerUntil.Format(time.RFC3339))
+			r.cbLoggedActive = true
+		}
+		r.cbMu.Unlock()
+		return
+	}
+	r.cbMu.Unlock()
+
 	pending := r.store.GetPendingCreates()
 	for _, inst := range pending {
 		intentID := inst.IntentID
@@ -282,6 +327,17 @@ func (r *vcdInstanceGroup) doCreate(intentID string) {
 		InstancesFailedTotal.WithLabelValues(r.store.instanceGroupName, "create").Inc()
 		r.log.Error("instance creation failed", "intentID", intentID, "error", err)
 
+		r.cbMu.Lock()
+		r.consecutiveCreateFailures++
+		if r.consecutiveCreateFailures >= circuitBreakerThreshold {
+			r.circuitBreakerUntil = time.Now().Add(circuitBreakerCooldown)
+			r.cbLoggedActive = false // allow one "active" log after trip
+			r.log.Warn("circuit breaker tripped, pausing creates",
+				"consecutive_failures", r.consecutiveCreateFailures,
+				"cooldown", circuitBreakerCooldown)
+		}
+		r.cbMu.Unlock()
+
 		// Back to PendingCreate with retry backoff
 		r.store.UpdateInstance(intentID, func(inst *Instance) {
 			inst.Phase = PhasePendingCreate
@@ -294,6 +350,14 @@ func (r *vcdInstanceGroup) doCreate(intentID string) {
 		})
 		return
 	}
+
+	r.cbMu.Lock()
+	if r.consecutiveCreateFailures > 0 {
+		r.log.Info("circuit breaker reset, create succeeded after failures",
+			"previous_failures", r.consecutiveCreateFailures)
+	}
+	r.consecutiveCreateFailures = 0
+	r.cbMu.Unlock()
 
 	InstancesCreatedTotal.WithLabelValues(r.store.instanceGroupName).Inc()
 

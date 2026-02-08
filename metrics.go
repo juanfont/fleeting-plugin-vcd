@@ -98,11 +98,6 @@ var (
 		Help: "Instances by fleeting state in state store",
 	}, []string{instanceGroupLabel, "state"})
 
-	StateManagerInstancesPreexisting = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "fleeting_vcd_state_manager_instances_preexisting",
-		Help: "Preexisting instances (discovered, not created by us)",
-	}, []string{instanceGroupLabel})
-
 	// Reconciler Metrics
 	ReconcileDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "fleeting_vcd_reconcile_duration_seconds",
