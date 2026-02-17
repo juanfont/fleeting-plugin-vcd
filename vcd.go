@@ -7,10 +7,11 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"text/template"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"text/template"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -41,6 +42,10 @@ const (
 	refreshBackoffMaxInterval    = 1 * time.Minute
 	refreshBackoffMaxElapsedTime = 20 * time.Minute
 
+	sshReadinessTimeout      = 5 * time.Minute
+	sshReadinessRetryInterval = 5 * time.Second
+	sshHandshakeTimeout      = 10 * time.Second
+
 	vcdAPIVersion = "38.1"
 )
 
@@ -48,6 +53,83 @@ type trustedPlatformModuleEdit struct {
 	XMLName    xml.Name `xml:"root:TrustedPlatformModule"`
 	Xmlns      string   `xml:"xmlns:root,attr"`
 	TpmPresent bool     `xml:"root:TpmPresent"`
+}
+
+// waitForSSHReadiness attempts a full SSH handshake to verify the VM is reachable
+// and sshd is functioning. It uses the same credentials that the runner/taskscaler
+// will use (from ConnectorConfig), so if this succeeds, the runner will be able to
+// connect too.
+func (g *InstanceGroup) waitForSSHReadiness(ipAddress string) error {
+	port := g.settings.ProtocolPort
+	if port == 0 {
+		port = 22
+	}
+	addr := fmt.Sprintf("%s:%d", ipAddress, port)
+
+	// Build SSH auth methods from ConnectorConfig (same creds the runner uses)
+	var authMethods []ssh.AuthMethod
+	if g.settings.Password != "" {
+		authMethods = append(authMethods, ssh.Password(g.settings.Password))
+	}
+	if g.settings.Key != nil {
+		signer, err := ssh.ParsePrivateKey(g.settings.Key)
+		if err != nil {
+			return fmt.Errorf("failed to parse SSH key for readiness check: %w", err)
+		}
+		authMethods = append(authMethods, ssh.PublicKeys(signer))
+	}
+
+	if len(authMethods) == 0 {
+		// No static credentials configured — skip the SSH check.
+		// The runner will handle authentication itself.
+		g.log.Warn("skipping SSH readiness check: no static credentials configured")
+		return nil
+	}
+
+	// Determine username (same logic as ConnectInfo)
+	username := "root"
+	if strings.Contains(strings.ToLower(g.settings.OS), "windows") {
+		username = "Administrator"
+	}
+
+	config := &ssh.ClientConfig{
+		User:            username,
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         sshHandshakeTimeout,
+	}
+
+	g.log.Info("waiting for SSH readiness", "addr", addr, "username", username)
+
+	deadline := time.Now().Add(sshReadinessTimeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, sshHandshakeTimeout)
+		if err != nil {
+			lastErr = err
+			g.log.Debug("SSH not reachable yet", "addr", addr, "error", err)
+			time.Sleep(sshReadinessRetryInterval)
+			continue
+		}
+
+		// TCP connected — attempt SSH handshake
+		sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
+		if err != nil {
+			conn.Close()
+			lastErr = err
+			g.log.Debug("SSH handshake failed", "addr", addr, "error", err)
+			time.Sleep(sshReadinessRetryInterval)
+			continue
+		}
+
+		// Success — clean up and return
+		client := ssh.NewClient(sshConn, chans, reqs)
+		client.Close()
+		g.log.Info("SSH readiness check passed", "addr", addr)
+		return nil
+	}
+
+	return fmt.Errorf("SSH readiness check timed out after %s for %s: %w", sshReadinessTimeout, addr, lastErr)
 }
 
 // createResult holds the result of a successful instance creation.
@@ -347,6 +429,15 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 
 	if status, err := vm.GetStatus(); err != nil || status != "POWERED_ON" {
 		return nil, fmt.Errorf("vm %s is not powered on: status=%s err=%v", vm.VM.Name, status, err)
+	}
+
+	// Verify the VM is actually reachable via SSH before declaring success.
+	// This catches VMs that boot but have broken networking, sshd not starting, etc.
+	if err := g.waitForSSHReadiness(ipAddress); err != nil {
+		g.log.Error("SSH readiness check failed", "error", err,
+			"vm", vm.VM.Name, "vapp_href", vapp.VApp.HREF, "ip_address", ipAddress,
+		)
+		return nil, fmt.Errorf("VM powered on but not reachable via SSH: %w", err)
 	}
 
 	g.log.Info("instance created successfully",
