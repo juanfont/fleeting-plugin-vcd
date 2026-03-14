@@ -157,7 +157,16 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 				"vapp_name", vAppName,
 				"error", err,
 			)
-			go g.cleanUpInstanceByName(vAppName)
+			go func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						g.log.Error("panic in createInstance cleanup", "vapp_name", vAppName, "panic", rec)
+					}
+				}()
+				if cleanupErr := g.cleanUpInstanceByName(vAppName); cleanupErr != nil {
+					g.log.Error("createInstance cleanup failed", "vapp_name", vAppName, "error", cleanupErr)
+				}
+			}()
 		}
 	}()
 
@@ -539,17 +548,23 @@ func (g *InstanceGroup) cleanUpInstanceByName(name string) error {
 		return err
 	}
 
-	org, err := client.GetOrgByName(g.Org)
+	org, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "GetOrgByName(cleanup)", func() (*govcd.Org, error) {
+		return client.GetOrgByName(g.Org)
+	})
 	if err != nil {
 		return err
 	}
 
-	vdc, err := org.GetVDCByName(g.VirtualDatacenter, true)
+	vdc, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "GetVDCByName(cleanup)", func() (*govcd.Vdc, error) {
+		return org.GetVDCByName(g.VirtualDatacenter, true)
+	})
 	if err != nil {
 		return err
 	}
 
-	vapp, err := vdc.GetVAppByName(name, true)
+	vapp, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "GetVAppByName(cleanup)", func() (*govcd.VApp, error) {
+		return vdc.GetVAppByName(name, true)
+	})
 	if err != nil {
 		return err
 	}
@@ -605,12 +620,16 @@ func (g *InstanceGroup) deleteInstance(href string) (err error) {
 	// If no VMs in vApp (empty vApp from interrupted creation), skip VM handling
 	if vapp.VApp.Children == nil || len(vapp.VApp.Children.VM) == 0 {
 		g.log.Info("deleting empty vApp (no VMs)", "href", href, "vapp", vapp.VApp.Name)
-		task, err := vapp.Delete()
-		if err != nil {
-			g.log.Error("error deleting empty vApp", "href", href, "error", err)
-			return err
+		emptyDelTask, delErr := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "Delete(emptyVApp)", func() (govcd.Task, error) {
+			return vapp.Delete()
+		})
+		if delErr != nil {
+			g.log.Error("error deleting empty vApp", "href", href, "error", delErr)
+			return delErr
 		}
-		return task.WaitTaskCompletion()
+		return safeVCDCallVoid(context.Background(), g.log, g.InstanceGroupName, "WaitTaskCompletion(Delete emptyVApp)", func() error {
+			return emptyDelTask.WaitTaskCompletion()
+		})
 	}
 
 	if len(vapp.VApp.Children.VM) != 1 {
@@ -632,11 +651,15 @@ func (g *InstanceGroup) deleteInstance(href string) (err error) {
 				"href", href, "vm_href", vm.VM.HREF, "error", err)
 		}
 		// Fall through to delete the vApp directly — skip PowerOff/Undeploy since we can't refresh the VM
-		task, delErr := vapp.Delete()
+		fallbackTask, delErr := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "Delete(fallback)", func() (govcd.Task, error) {
+			return vapp.Delete()
+		})
 		if delErr != nil {
 			return delErr
 		}
-		return task.WaitTaskCompletion()
+		return safeVCDCallVoid(context.Background(), g.log, g.InstanceGroupName, "WaitTaskCompletion(Delete fallback)", func() error {
+			return fallbackTask.WaitTaskCompletion()
+		})
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), deleteInstanceTimeout)
@@ -654,34 +677,43 @@ func (g *InstanceGroup) deleteInstance(href string) (err error) {
 		"statusInt", vapp.VApp.Status,
 	)
 
-	task, err := vapp.PowerOff()
+	powerOffTask, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "PowerOff", func() (govcd.Task, error) {
+		return vapp.PowerOff()
+	})
 	if err != nil {
 		g.log.Info("unable to power off as it's already powered off", "error", err, "vapp", vapp.VApp.Name)
 	} else {
-		err = task.WaitTaskCompletion()
-		if err != nil {
-			return err
-		}
-	}
-	task, err = vapp.Undeploy()
-	if err != nil {
-		// it's fine if the VApp is already powered off
-		g.log.Info("unable to undeploy VApp, probably because it is already off", "error", err, "vapp", vapp.VApp.Name)
-	} else {
-		err = task.WaitTaskCompletion()
-		if err != nil {
+		if err = safeVCDCallVoid(context.Background(), g.log, g.InstanceGroupName, "WaitTaskCompletion(PowerOff)", func() error {
+			return powerOffTask.WaitTaskCompletion()
+		}); err != nil {
 			return err
 		}
 	}
 
-	task, err = vapp.Delete()
+	undeployTask, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "Undeploy", func() (govcd.Task, error) {
+		return vapp.Undeploy()
+	})
+	if err != nil {
+		g.log.Info("unable to undeploy VApp, probably because it is already off", "error", err, "vapp", vapp.VApp.Name)
+	} else {
+		if err = safeVCDCallVoid(context.Background(), g.log, g.InstanceGroupName, "WaitTaskCompletion(Undeploy)", func() error {
+			return undeployTask.WaitTaskCompletion()
+		}); err != nil {
+			return err
+		}
+	}
+
+	deleteTask, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "Delete", func() (govcd.Task, error) {
+		return vapp.Delete()
+	})
 	if err != nil {
 		g.log.Error("error deleting vapp, will be retried by reconciler", "href", href, "error", err)
 		return err
 	}
 
-	err = task.WaitTaskCompletion()
-	if err != nil {
+	if err = safeVCDCallVoid(context.Background(), g.log, g.InstanceGroupName, "WaitTaskCompletion(Delete)", func() error {
+		return deleteTask.WaitTaskCompletion()
+	}); err != nil {
 		return err
 	}
 
