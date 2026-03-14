@@ -42,9 +42,9 @@ const (
 	refreshBackoffMaxInterval    = 1 * time.Minute
 	refreshBackoffMaxElapsedTime = 20 * time.Minute
 
-	sshReadinessTimeout      = 5 * time.Minute
+	sshReadinessTimeout       = 5 * time.Minute
 	sshReadinessRetryInterval = 5 * time.Second
-	sshHandshakeTimeout      = 10 * time.Second
+	sshHandshakeTimeout       = 10 * time.Second
 
 	vcdAPIVersion = "38.1"
 )
@@ -183,8 +183,11 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 
 	tmpl, err := g.getVAppTemplate()
 	if err != nil {
+		g.log.Error("error getting vApp template", "error", err)
 		return nil, err
 	}
+
+	g.log.Info("vApp template found", "vapp_template", tmpl.VAppTemplate.Name)
 
 	network, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "GetOrgVdcNetworkByName", func() (*govcd.OrgVDCNetwork, error) {
 		return vdc.GetOrgVdcNetworkByName(g.Network, true)
@@ -241,6 +244,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 
 	// Step 3: Add org network to vApp (fast — required before adding VM with network)
 	if err = safeVCDCallVoid(context.Background(), g.log, g.InstanceGroupName, "AddRAWNetworkConfig", func() error {
+		g.log.Info("adding network config to vApp", "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name, "networks", networks)
 		networkTask, netErr := vapp.AddRAWNetworkConfig(networks)
 		if netErr != nil {
 			return netErr
@@ -262,6 +266,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 	}
 
 	addVMTask, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "AddNewVMWithStorageProfile", func() (govcd.Task, error) {
+		g.log.Info("adding VM to vApp", "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name, "netSection", netSection, "storageProfile", storageProfile)
 		return vapp.AddNewVMWithStorageProfile(vAppName, *tmpl, netSection, storageProfile, true)
 	})
 	if err != nil {
