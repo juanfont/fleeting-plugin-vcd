@@ -274,9 +274,25 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		return nil, err
 	}
 
+	// TODO(juan): If we have configured a compute policy, we should use it instead of the default one.
+	computePolicy, err := g.getDefaultComputePolicy()
+	if err != nil {
+		g.log.Error("error getting compute policy", "error", err)
+		return nil, err
+	}
+
+	g.log.Info("using compute policy", "compute_policy", computePolicy.VdcComputePolicy)
+
 	addVMTask, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "AddNewVMWithStorageProfile", func() (govcd.Task, error) {
 		g.log.Info("adding VM to vApp", "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name, "netSection", netSection, "storageProfile", storageProfile)
-		return vapp.AddNewVMWithStorageProfile(vAppName, *tmpl, netSection, storageProfile, true)
+		return vapp.AddNewVMWithComputePolicy(
+			vAppName,
+			*tmpl,
+			netSection,
+			storageProfile,
+			computePolicy.VdcComputePolicy,
+			true,
+		)
 	})
 	if err != nil {
 		g.log.Error("error adding VM to vApp", "error", err,
@@ -528,7 +544,7 @@ func (g *InstanceGroup) getInstancesInInstanceGroup() (vApps []*govcd.VApp, err 
 	}
 
 	type searchResult struct {
-		results []govcd.QueryItem
+		results     []govcd.QueryItem
 		explanation string
 	}
 	sr, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "SearchByFilter", func() (searchResult, error) {
@@ -927,6 +943,41 @@ func (g *InstanceGroup) getVMNetworkConnectionSection() (*types.NetworkConnectio
 	netConn.Network = g.Network
 
 	return netSection, nil
+}
+
+func (g *InstanceGroup) getDefaultComputePolicy() (*govcd.VdcComputePolicy, error) {
+	client, err := g.getVCDClient()
+	if err != nil {
+		return nil, err
+	}
+
+	org, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "GetOrgByName(computePolicy)", func() (*govcd.Org, error) {
+		return client.GetOrgByName(g.Org)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	vdc, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "GetVDCByName(computePolicy)", func() (*govcd.Vdc, error) {
+		return org.GetVDCByName(g.VirtualDatacenter, true)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	defaultComputePolicy := vdc.Vdc.DefaultComputePolicy
+	if defaultComputePolicy == nil {
+		return nil, fmt.Errorf("default compute policy not found")
+	}
+
+	computePolicy, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "GetVdcComputePolicyById(computePolicy)", func() (*govcd.VdcComputePolicy, error) {
+		return org.GetVdcComputePolicyById(defaultComputePolicy.ID)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error getting compute policy: %w", err)
+	}
+
+	return computePolicy, nil
 }
 
 func (g *InstanceGroup) injectCredentials(vm *govcd.VM) error {
