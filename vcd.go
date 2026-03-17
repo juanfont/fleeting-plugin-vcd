@@ -277,11 +277,11 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 	// TODO(juan): If we have configured a compute policy, we should use it instead of the default one.
 	computePolicy, err := g.getDefaultComputePolicy()
 	if err != nil {
-		g.log.Error("error getting compute policy", "error", err)
-		return nil, err
+		g.log.Warn("error getting default compute policy, using default one", "error", err)
+		computePolicy = nil
+	} else {
+		g.log.Info("using compute policy", "compute_policy", computePolicy.Name)
 	}
-
-	g.log.Info("using compute policy", "compute_policy", computePolicy.VdcComputePolicy)
 
 	addVMTask, err := safeVCDCall(context.Background(), g.log, g.InstanceGroupName, "AddNewVMWithStorageProfile", func() (govcd.Task, error) {
 		g.log.Info("adding VM to vApp", "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name, "netSection", netSection, "storageProfile", storageProfile)
@@ -290,7 +290,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 			*tmpl,
 			netSection,
 			storageProfile,
-			computePolicy.VdcComputePolicy,
+			computePolicy,
 			true,
 		)
 	})
@@ -945,7 +945,7 @@ func (g *InstanceGroup) getVMNetworkConnectionSection() (*types.NetworkConnectio
 	return netSection, nil
 }
 
-func (g *InstanceGroup) getDefaultComputePolicy() (*govcd.VdcComputePolicy, error) {
+func (g *InstanceGroup) getDefaultComputePolicy() (*types.VdcComputePolicy, error) {
 	client, err := g.getVCDClient()
 	if err != nil {
 		return nil, err
@@ -977,7 +977,7 @@ func (g *InstanceGroup) getDefaultComputePolicy() (*govcd.VdcComputePolicy, erro
 		return nil, fmt.Errorf("error getting compute policy: %w", err)
 	}
 
-	return computePolicy, nil
+	return computePolicy.VdcComputePolicy, nil
 }
 
 func (g *InstanceGroup) injectCredentials(vm *govcd.VM) error {
