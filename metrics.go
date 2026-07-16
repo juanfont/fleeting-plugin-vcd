@@ -73,7 +73,7 @@ var (
 	APIDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "fleeting_vcd_api_duration_seconds",
 		Help:    "Time taken for VCD API calls",
-		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60},
+		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1200, 1800, 3600}, // 0.1s to 60min
 	}, []string{instanceGroupLabel, "operation"})
 
 	// Pool Status Metrics
@@ -102,7 +102,7 @@ var (
 	ReconcileDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "fleeting_vcd_reconcile_duration_seconds",
 		Help:    "Time taken for a single reconciliation cycle",
-		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120},
+		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1200, 1800, 3600}, // 0.1s to 60min
 	}, []string{instanceGroupLabel})
 
 	ReconcileTotal = promauto.NewCounterVec(prometheus.CounterOpts{
