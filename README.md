@@ -66,6 +66,7 @@ The plugin is configured via the GitLab Runner's `config.toml` file under `[runn
 | `debug_server_addr` | Debug HTTP server address (e.g., `127.0.0.1:27060`) | disabled |
 | `max_concurrent_creates` | Maximum number of VMs being created simultaneously | `3` |
 | `max_concurrent_deletes` | Maximum number of VMs being deleted simultaneously | `5` |
+| `session_refresh_interval` | Renew the shared VCD session before API work after this interval; positive Go duration below 24h | `"20h"` |
 
 ### Example Configuration
 
@@ -143,6 +144,18 @@ export VCD_DISK_SIZE_GB="50"
 
 make test
 ```
+
+To exercise session renewal during real create/delete task polling with the same
+test environment, run:
+
+```bash
+go test -run '^TestInstanceGroup_SessionRenewal$' -timeout 2h -count=1
+```
+
+This test creates and deletes one VM, uses a 30-second renewal interval, and sends
+an invalid bearer on one task read during each operation to trigger a real 401.
+It does not revoke the API token. Production validation still requires observing
+a runner for more than 48 hours with the default 20-hour renewal interval.
 
 ## History
 

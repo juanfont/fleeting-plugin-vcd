@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/vmware/go-vcloud-director/v3/govcd"
@@ -28,28 +30,34 @@ const (
 )
 
 type InstanceGroup struct {
-	Name      string           `json:"name"`
-	vcdClient *govcd.VCDClient `json:"-"`
+	Name                   string           `json:"name"`
+	vcdClient              *govcd.VCDClient `json:"-"`
+	clientMu               sync.RWMutex
+	lastAuthenticated      time.Time
+	authGeneration         uint64
+	sessionRefreshInterval time.Duration
+	failedCreateCleanups   sync.Map // vApp name -> time cleanup was first requested
 
 	// Cloud Director connection config
-	StrURL               string `json:"url"`
-	Org                  string `json:"org"`
-	Token                string `json:"token"`
-	VirtualDatacenter    string `json:"virtual_datacenter"`
-	Network              string `json:"network"`
-	IPAllocationMode     string `json:"ip_allocation_mode"`
-	InstanceGroupName    string `json:"instance_group_name"`
-	VAppNamePrefix       string `json:"vapp_name_prefix"`
-	Catalog              string `json:"catalog"`
-	Template             string `json:"template"`
-	StorageProfile       string `json:"storage_profile"`
-	CPUCount             int    `json:"cpu_count"`
-	CoresPerSocket       int    `json:"cores_per_socket"`
-	MemoryMB             int64  `json:"memory_mb"`
-	DiskSizeGB           int    `json:"disk_size_gb"`
-	DebugServerAddr      string `json:"debug_server_addr"`
-	MaxConcurrentCreates int    `json:"max_concurrent_creates"`
-	MaxConcurrentDeletes int    `json:"max_concurrent_deletes"`
+	StrURL                 string `json:"url"`
+	Org                    string `json:"org"`
+	Token                  string `json:"token"`
+	VirtualDatacenter      string `json:"virtual_datacenter"`
+	Network                string `json:"network"`
+	IPAllocationMode       string `json:"ip_allocation_mode"`
+	InstanceGroupName      string `json:"instance_group_name"`
+	VAppNamePrefix         string `json:"vapp_name_prefix"`
+	Catalog                string `json:"catalog"`
+	Template               string `json:"template"`
+	StorageProfile         string `json:"storage_profile"`
+	CPUCount               int    `json:"cpu_count"`
+	CoresPerSocket         int    `json:"cores_per_socket"`
+	MemoryMB               int64  `json:"memory_mb"`
+	DiskSizeGB             int    `json:"disk_size_gb"`
+	DebugServerAddr        string `json:"debug_server_addr"`
+	MaxConcurrentCreates   int    `json:"max_concurrent_creates"`
+	MaxConcurrentDeletes   int    `json:"max_concurrent_deletes"`
+	SessionRefreshInterval string `json:"session_refresh_interval"`
 
 	parsedURL *url.URL
 

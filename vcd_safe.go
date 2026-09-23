@@ -7,24 +7,23 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	"github.com/hashicorp/go-hclog"
+	"github.com/vmware/go-vcloud-director/v3/govcd"
 )
 
-// permanentErrorPatterns are VCD error messages that should not be retried.
-// These indicate resource limits or configuration issues that won't resolve on retry.
 var permanentErrorPatterns = []string{
 	"exceed the VDC's storage quota",
 	"entity does not exist",
 	"Unable to perform this action",
+	"already exists",
 }
 
 func isPermanentError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
+	msg := strings.ToLower(err.Error())
 	for _, pattern := range permanentErrorPatterns {
-		if strings.Contains(msg, pattern) {
+		if strings.Contains(msg, strings.ToLower(pattern)) {
 			return true
 		}
 	}
@@ -33,58 +32,93 @@ func isPermanentError(err error) bool {
 
 const (
 	safeCallMaxElapsedTime  = 5 * time.Minute
-	safeCallInitialInterval = 1 * time.Second
+	safeCallInitialInterval = time.Second
 )
 
-// safeVCDCall wraps any VCD API call with panic recovery + exponential backoff retry.
-// The go-vcloud-director library is known to panic randomly, and the VCD API is slow
-// and unreliable. This wrapper ensures every call is recoverable.
-// The context controls cancellation and timeout — when the context expires, retries stop.
-func safeVCDCall[T any](ctx context.Context, log hclog.Logger, instanceGroup string, desc string, fn func() (T, error)) (result T, err error) {
+func vcdCallAttempt[T any](ctx context.Context, g *InstanceGroup, desc string, fn func() (T, error), restore []func()) (result T, generation uint64, err error) {
+	generation, err = g.lockSession(ctx)
+	if err != nil {
+		return result, generation, err
+	}
+	defer g.clientMu.RUnlock()
+	defer func() {
+		if rec := recover(); rec != nil {
+			g.log.Error("panic recovered in VCD call", "operation", desc, "panic", rec)
+			err = fmt.Errorf("panic in %s: %v", desc, rec)
+		}
+		if err != nil {
+			for _, rollback := range restore {
+				rollback()
+			}
+		}
+	}()
+	result, err = fn()
+	return result, generation, err
+}
+
+// safeVCDCall retries reads and repeatable operations. Authentication errors
+// renew the shared client before retrying the same object.
+func safeVCDCall[T any](ctx context.Context, g *InstanceGroup, desc string, fn func() (T, error), restore ...func()) (T, error) {
+	return vcdCall(ctx, g, desc, fn, true, restore)
+}
+
+// singleVCDCall never replays a mutation, including when an SDK method reports
+// a 401 from a read AFTER the mutation succeeded. Renew for subsequent recovery.
+func singleVCDCall[T any](ctx context.Context, g *InstanceGroup, desc string, fn func() (T, error), restore ...func()) (T, error) {
+	return vcdCall(ctx, g, desc, fn, false, restore)
+}
+
+func vcdCall[T any](ctx context.Context, g *InstanceGroup, desc string, fn func() (T, error), retry bool, restore []func()) (result T, err error) {
 	startTime := time.Now()
-
+	defer func() {
+		APICallsTotal.WithLabelValues(g.InstanceGroupName, desc).Inc()
+		APIDuration.WithLabelValues(g.InstanceGroupName, desc).Observe(time.Since(startTime).Seconds())
+		if err != nil {
+			APIErrorsTotal.WithLabelValues(g.InstanceGroupName, desc).Inc()
+			g.log.Error("VCD call failed", "operation", desc, "error", err)
+		}
+	}()
 	op := func() (T, error) {
-		var val T
-		var opErr error
-
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Error("panic recovered in VCD call", "operation", desc, "panic", r)
-					opErr = fmt.Errorf("panic in %s: %v", desc, r)
-				}
-			}()
-			val, opErr = fn()
-		}()
-
+		val, generation, opErr := vcdCallAttempt(ctx, g, desc, fn, restore)
+		if isUnauthorizedError(opErr) {
+			if authErr := g.refreshSession(ctx, generation); authErr != nil {
+				return val, fmt.Errorf("%w; session renewal failed: %v", opErr, authErr)
+			}
+			if retry {
+				val, _, opErr = vcdCallAttempt(ctx, g, desc, fn, restore)
+			}
+		}
 		if isPermanentError(opErr) {
 			return val, backoff.Permanent(opErr)
 		}
 		return val, opErr
 	}
-
+	if !retry {
+		return op()
+	}
 	bo := backoff.NewExponentialBackOff(
 		backoff.WithMaxElapsedTime(safeCallMaxElapsedTime),
 		backoff.WithInitialInterval(safeCallInitialInterval),
 	)
-
-	result, err = backoff.RetryWithData(op, backoff.WithContext(bo, ctx))
-
-	duration := time.Since(startTime).Seconds()
-	APICallsTotal.WithLabelValues(instanceGroup, desc).Inc()
-	APIDuration.WithLabelValues(instanceGroup, desc).Observe(duration)
-	if err != nil {
-		APIErrorsTotal.WithLabelValues(instanceGroup, desc).Inc()
-		log.Error("VCD call failed after retries", "operation", desc, "error", err)
-	}
-
-	return result, err
+	return backoff.RetryWithData(op, backoff.WithContext(bo, ctx))
 }
 
-// safeVCDCallVoid is safeVCDCall for void operations.
-func safeVCDCallVoid(ctx context.Context, log hclog.Logger, instanceGroup string, desc string, fn func() error) error {
-	_, err := safeVCDCall(ctx, log, instanceGroup, desc, func() (struct{}, error) {
+func safeVCDCallVoid(ctx context.Context, g *InstanceGroup, desc string, fn func() error, restore ...func()) error {
+	_, err := safeVCDCall(ctx, g, desc, func() (struct{}, error) {
 		return struct{}{}, fn()
-	})
+	}, restore...)
 	return err
+}
+
+// SDK Refresh methods replace the payload before issuing the request. Restore
+// it on failure so retries retain the HREF, including Refresh calls inside
+// higher-level SDK methods such as GetStatus and ChangeMemory.
+func preserveVM(vm *govcd.VM) func() {
+	previous := vm.VM
+	return func() { vm.VM = previous }
+}
+
+func preserveVApp(vapp *govcd.VApp) func() {
+	previous := vapp.VApp
+	return func() { vapp.VApp = previous }
 }

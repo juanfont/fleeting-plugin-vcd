@@ -2,6 +2,7 @@ package vcd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -161,6 +162,7 @@ func (r *vcdInstanceGroup) reconcileOnce(doGC bool) {
 
 	// Step 3: Dispatch pending deletes
 	r.dispatchDeletes()
+	r.dispatchCreateCleanups()
 
 	// Step 4: GC check
 	if doGC {
@@ -202,7 +204,7 @@ func (r *vcdInstanceGroup) pollVCD() {
 
 			// Try to get IP address and OS type from the VM
 			vmHREF := vapp.VApp.Children.VM[0].HREF
-			pollResult, err := safeVCDCall(context.Background(), r.log, r.ig.InstanceGroupName, "refresh VM for poll", func() (*vmPollResult, error) {
+			pollResult, err := safeVCDCall(context.Background(), r.ig, "refresh VM for poll", func() (*vmPollResult, error) {
 				vm := govcd.NewVM(&client.Client)
 				vm.VM.HREF = vmHREF
 				if err := vm.Refresh(); err != nil {
@@ -416,6 +418,40 @@ func (r *vcdInstanceGroup) dispatchDeletes() {
 	}
 }
 
+// Failed creates may not have received metadata yet, so discovery cannot be
+// relied on for cleanup. Retain their names until deletion is confirmed.
+func (r *vcdInstanceGroup) dispatchCreateCleanups() {
+	r.ig.failedCreateCleanups.Range(func(key, value any) bool {
+		name := key.(string)
+		requestedAt := value.(time.Time)
+		cleanupKey := "create:" + name
+		if _, loaded := r.backgroundDeletes.LoadOrStore(cleanupKey, true); loaded {
+			return true
+		}
+		if !r.deleteSem.TryAcquire(1) {
+			r.backgroundDeletes.Delete(cleanupKey)
+			return false
+		}
+		go func() {
+			defer r.deleteSem.Release(1)
+			defer r.backgroundDeletes.Delete(cleanupKey)
+			defer func() {
+				if rec := recover(); rec != nil {
+					r.log.Error("panic cleaning up failed create", "name", name, "panic", rec)
+				}
+			}()
+			err := r.ig.cleanUpInstanceByName(name)
+			// Allow time for a POST whose response was lost to become visible.
+			if err == nil || (errors.Is(err, govcd.ErrorEntityNotFound) && time.Since(requestedAt) >= safeCallMaxElapsedTime) {
+				r.ig.failedCreateCleanups.Delete(name)
+			} else {
+				r.log.Warn("failed create cleanup will be retried", "name", name, "error", err)
+			}
+		}()
+		return true
+	})
+}
+
 func (r *vcdInstanceGroup) doDelete(intentID, href string) {
 	startTime := time.Now()
 
@@ -536,6 +572,12 @@ func (r *vcdInstanceGroup) Shutdown(ctx context.Context) error {
 		}
 
 		// Delete all remaining instances
+		r.ig.failedCreateCleanups.Range(func(key, value any) bool {
+			if err := r.ig.cleanUpInstanceByName(key.(string)); err != nil && !errors.Is(err, govcd.ErrorEntityNotFound) {
+				r.shutdownErr = errors.Join(r.shutdownErr, fmt.Errorf("cleanup failed create %s: %w", key, err))
+			}
+			return true
+		})
 		r.log.Info("cleaning up all instances")
 		instances := r.store.GetAll()
 		for _, inst := range instances {

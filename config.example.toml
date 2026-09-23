@@ -44,6 +44,9 @@ org = "VcdOrg"
 # API token for authentication (requires VCD 10.4+)
 token = "fooooooobarr"
 
+# Renew the VCD bearer session before its 24-hour maximum lifetime.
+session_refresh_interval = "20h"
+
 # Virtual Datacenter within the organization
 virtual_datacenter = "orgvdc"
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"time"
 
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
@@ -102,6 +103,15 @@ func (g *InstanceGroup) validate() error {
 }
 
 func (g *InstanceGroup) populate() error {
+	g.sessionRefreshInterval = defaultSessionRefreshInterval
+	if g.SessionRefreshInterval != "" {
+		interval, err := time.ParseDuration(g.SessionRefreshInterval)
+		if err != nil || interval <= 0 || interval >= 24*time.Hour {
+			return fmt.Errorf("session_refresh_interval must be a positive duration below 24h")
+		}
+		g.sessionRefreshInterval = interval
+	}
+
 	parsedURL, err := url.Parse(g.StrURL)
 	if err != nil {
 		return fmt.Errorf("invalid url: %s", err)

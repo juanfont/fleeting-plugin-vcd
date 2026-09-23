@@ -22,7 +22,7 @@ func shortCtx() context.Context {
 }
 
 func TestSafeVCDCall_Success(t *testing.T) {
-	result, err := safeVCDCall(context.Background(), testLogger(), "test", "test-op", func() (string, error) {
+	result, err := safeVCDCall(context.Background(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "test-op", func() (string, error) {
 		return "hello", nil
 	})
 
@@ -33,7 +33,7 @@ func TestSafeVCDCall_Success(t *testing.T) {
 func TestSafeVCDCall_Error(t *testing.T) {
 	var calls atomic.Int32
 
-	_, err := safeVCDCall(shortCtx(), testLogger(), "test", "test-op", func() (string, error) {
+	_, err := safeVCDCall(shortCtx(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "test-op", func() (string, error) {
 		calls.Add(1)
 		return "", errors.New("permanent error")
 	})
@@ -46,7 +46,7 @@ func TestSafeVCDCall_Error(t *testing.T) {
 func TestSafeVCDCall_RecoversPanic(t *testing.T) {
 	var calls atomic.Int32
 
-	_, err := safeVCDCall(shortCtx(), testLogger(), "test", "panic-op", func() (string, error) {
+	_, err := safeVCDCall(shortCtx(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "panic-op", func() (string, error) {
 		calls.Add(1)
 		panic("vcd library exploded")
 	})
@@ -61,7 +61,7 @@ func TestSafeVCDCall_RecoversPanic(t *testing.T) {
 func TestSafeVCDCall_RetriesTransientErrors(t *testing.T) {
 	var calls atomic.Int32
 
-	result, err := safeVCDCall(shortCtx(), testLogger(), "test", "retry-op", func() (int, error) {
+	result, err := safeVCDCall(shortCtx(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "retry-op", func() (int, error) {
 		n := calls.Add(1)
 		if n < 3 {
 			return 0, errors.New("transient error")
@@ -77,7 +77,7 @@ func TestSafeVCDCall_RetriesTransientErrors(t *testing.T) {
 func TestSafeVCDCall_RetriesPanicThenSucceeds(t *testing.T) {
 	var calls atomic.Int32
 
-	result, err := safeVCDCall(shortCtx(), testLogger(), "test", "panic-then-ok", func() (string, error) {
+	result, err := safeVCDCall(shortCtx(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "panic-then-ok", func() (string, error) {
 		n := calls.Add(1)
 		if n == 1 {
 			panic("first call panics")
@@ -91,7 +91,7 @@ func TestSafeVCDCall_RetriesPanicThenSucceeds(t *testing.T) {
 }
 
 func TestSafeVCDCallVoid_Success(t *testing.T) {
-	err := safeVCDCallVoid(context.Background(), testLogger(), "test", "void-op", func() error {
+	err := safeVCDCallVoid(context.Background(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "void-op", func() error {
 		return nil
 	})
 
@@ -99,7 +99,7 @@ func TestSafeVCDCallVoid_Success(t *testing.T) {
 }
 
 func TestSafeVCDCallVoid_Error(t *testing.T) {
-	err := safeVCDCallVoid(shortCtx(), testLogger(), "test", "void-op", func() error {
+	err := safeVCDCallVoid(shortCtx(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "void-op", func() error {
 		return errors.New("failed")
 	})
 
@@ -109,7 +109,7 @@ func TestSafeVCDCallVoid_Error(t *testing.T) {
 func TestSafeVCDCallVoid_RecoversPanic(t *testing.T) {
 	var calls atomic.Int32
 
-	err := safeVCDCallVoid(shortCtx(), testLogger(), "test", "void-panic", func() error {
+	err := safeVCDCallVoid(shortCtx(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "void-panic", func() error {
 		calls.Add(1)
 		panic("boom")
 	})
@@ -121,7 +121,7 @@ func TestSafeVCDCallVoid_RecoversPanic(t *testing.T) {
 func TestSafeVCDCallVoid_RetriesThenSucceeds(t *testing.T) {
 	var calls atomic.Int32
 
-	err := safeVCDCallVoid(shortCtx(), testLogger(), "test", "void-retry", func() error {
+	err := safeVCDCallVoid(shortCtx(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "void-retry", func() error {
 		n := calls.Add(1)
 		if n < 3 {
 			return errors.New("not yet")
@@ -139,7 +139,7 @@ func TestSafeVCDCall_StructResult(t *testing.T) {
 		Age  int
 	}
 
-	result, err := safeVCDCall(context.Background(), testLogger(), "test", "struct-op", func() (*myResult, error) {
+	result, err := safeVCDCall(context.Background(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "struct-op", func() (*myResult, error) {
 		return &myResult{Name: "test", Age: 42}, nil
 	})
 
@@ -152,7 +152,7 @@ func TestSafeVCDCall_StructResult(t *testing.T) {
 func TestSafeVCDCall_NilResult(t *testing.T) {
 	type myResult struct{}
 
-	result, err := safeVCDCall(shortCtx(), testLogger(), "test", "nil-op", func() (*myResult, error) {
+	result, err := safeVCDCall(shortCtx(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "nil-op", func() (*myResult, error) {
 		return nil, errors.New("nope")
 	})
 
@@ -169,7 +169,7 @@ func TestSafeVCDCall_ContextCancellation(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := safeVCDCall(ctx, testLogger(), "test", "cancel-op", func() (string, error) {
+	_, err := safeVCDCall(ctx, &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "cancel-op", func() (string, error) {
 		calls.Add(1)
 		return "", errors.New("keep retrying")
 	})
@@ -207,7 +207,7 @@ func TestIsPermanentError_Nil(t *testing.T) {
 func TestSafeVCDCall_PermanentErrorNoRetry(t *testing.T) {
 	var calls atomic.Int32
 
-	_, err := safeVCDCall(context.Background(), testLogger(), "test", "permanent-op", func() (string, error) {
+	_, err := safeVCDCall(context.Background(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "permanent-op", func() (string, error) {
 		calls.Add(1)
 		return "", errors.New("exceed the VDC's storage quota")
 	})
@@ -221,7 +221,7 @@ func TestSafeVCDCall_PermanentErrorNoRetry(t *testing.T) {
 func TestSafeVCDCall_PermanentErrorUnableToPerform(t *testing.T) {
 	var calls atomic.Int32
 
-	_, err := safeVCDCall(context.Background(), testLogger(), "test", "unable-op", func() (string, error) {
+	_, err := safeVCDCall(context.Background(), &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}, "unable-op", func() (string, error) {
 		calls.Add(1)
 		return "", errors.New("Unable to perform this action. Contact your cloud administrator.")
 	})
