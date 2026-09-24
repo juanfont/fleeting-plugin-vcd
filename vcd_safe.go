@@ -80,6 +80,15 @@ func vcdCall[T any](ctx context.Context, g *InstanceGroup, desc string, fn func(
 	}()
 	op := func() (T, error) {
 		val, generation, opErr := vcdCallAttempt(ctx, g, desc, fn, restore)
+		// Rejected before any task started, so waiting and replaying is safe
+		// even for calls that must never replay a mutation.
+		for g.throttle != nil && isOperationLimitError(opErr) {
+			g.throttle.throttled(desc)
+			if waitErr := g.throttle.wait(ctx); waitErr != nil {
+				return val, backoff.Permanent(fmt.Errorf("%w; waiting for vCD operation limit: %w", opErr, waitErr))
+			}
+			val, generation, opErr = vcdCallAttempt(ctx, g, desc, fn, restore)
+		}
 		if isUnauthorizedError(opErr) {
 			if authErr := g.refreshSession(ctx, generation); authErr != nil {
 				return val, fmt.Errorf("%w; session renewal failed: %v", opErr, authErr)

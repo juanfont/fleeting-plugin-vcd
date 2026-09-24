@@ -230,3 +230,59 @@ func TestSafeVCDCall_PermanentErrorUnableToPerform(t *testing.T) {
 	// Should NOT retry — only 1 call
 	assert.Equal(t, int32(1), calls.Load())
 }
+
+const operationLimitMsg = "API Error: 503: The maximum number of simultaneous operations for organization acme has been reached"
+
+func TestVCDCall_OperationLimitWaitsAndReplays(t *testing.T) {
+	calls := map[string]func(*InstanceGroup, func() (int, error)) (int, error){
+		"safe": func(g *InstanceGroup, fn func() (int, error)) (int, error) {
+			return safeVCDCall(shortCtx(), g, "op", fn)
+		},
+		"single": func(g *InstanceGroup, fn func() (int, error)) (int, error) {
+			return singleVCDCall(shortCtx(), g, "op", fn)
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			g := &InstanceGroup{log: testLogger(), InstanceGroupName: "test", throttle: testGate(20 * time.Millisecond)}
+			var n atomic.Int32
+			start := time.Now()
+			v, err := call(g, func() (int, error) {
+				if n.Add(1) <= 2 {
+					return 0, errors.New(operationLimitMsg)
+				}
+				return 7, nil
+			})
+			require.NoError(t, err)
+			assert.Equal(t, 7, v)
+			assert.Equal(t, int32(3), n.Load())
+			// Pauses of 20ms then 40ms: the second rejection started a new episode.
+			assert.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
+		})
+	}
+}
+
+func TestVCDCall_OperationLimitWaitHonoursContext(t *testing.T) {
+	g := &InstanceGroup{log: testLogger(), InstanceGroupName: "test", throttle: testGate(time.Hour)}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	var n atomic.Int32
+	_, err := safeVCDCall(ctx, g, "op", func() (int, error) {
+		n.Add(1)
+		return 0, errors.New(operationLimitMsg)
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Equal(t, int32(1), n.Load())
+}
+
+func TestVCDCall_OperationLimitWithoutGateIsNotReplayedForMutations(t *testing.T) {
+	g := &InstanceGroup{log: testLogger(), InstanceGroupName: "test"}
+	var n atomic.Int32
+	_, err := singleVCDCall(context.Background(), g, "op", func() (int, error) {
+		n.Add(1)
+		return 0, errors.New(operationLimitMsg)
+	})
+	require.Error(t, err)
+	assert.Equal(t, int32(1), n.Load())
+}

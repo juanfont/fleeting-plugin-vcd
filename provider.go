@@ -37,6 +37,9 @@ type InstanceGroup struct {
 	authGeneration         uint64
 	sessionRefreshInterval time.Duration
 	failedCreateCleanups   sync.Map // vApp name -> time cleanup was first requested
+	// throttle is shared with the reconciler; vCD calls report operation-limit
+	// rejections to it and wait out its pause. Nil disables throttling.
+	throttle *throttleGate
 
 	// Cloud Director connection config
 	StrURL                 string `json:"url"`
