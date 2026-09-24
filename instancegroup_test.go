@@ -55,11 +55,11 @@ func TestRetryDelay_Escalation(t *testing.T) {
 		minBase time.Duration
 		maxBase time.Duration
 	}{
-		{1, 7 * time.Second, 13 * time.Second},     // ~10s
-		{2, 15 * time.Second, 25 * time.Second},     // ~20s
-		{3, 30 * time.Second, 50 * time.Second},     // ~40s
-		{4, 60 * time.Second, 100 * time.Second},    // ~80s
-		{5, 120 * time.Second, 200 * time.Second},   // ~160s
+		{1, 7 * time.Second, 13 * time.Second},                 // ~10s
+		{2, 15 * time.Second, 25 * time.Second},                // ~20s
+		{3, 30 * time.Second, 50 * time.Second},                // ~40s
+		{4, 60 * time.Second, 100 * time.Second},               // ~80s
+		{5, 120 * time.Second, 200 * time.Second},              // ~160s
 		{6, 225 * time.Second, 6*time.Minute + 15*time.Second}, // ~300s (capped, +25% jitter)
 	} {
 		delay := retryDelay(tc.retry)
@@ -381,4 +381,43 @@ func TestGCCheck_MultipleOldInstances(t *testing.T) {
 		inst, _ := r.store.GetByIntentID(id)
 		assert.Equal(t, PhasePendingDelete, inst.Phase, "instance %s should be GC'd", id)
 	}
+}
+
+func TestCircuitBreaker_CooldownGrowsAcrossTrips(t *testing.T) {
+	r := newTestReconciler(t)
+	for i := 0; i < circuitBreakerThreshold; i++ {
+		r.recordCreateFailure()
+	}
+	first := time.Until(r.circuitBreakerUntil)
+	assert.GreaterOrEqual(t, first, 3*time.Minute+44*time.Second) // 5m - 25%
+	assert.LessOrEqual(t, first, 6*time.Minute+15*time.Second)    // 5m + 25%
+
+	// Failures of creates already in flight belong to the same trip.
+	r.recordCreateFailure()
+	assert.InDelta(t, first.Seconds(), time.Until(r.circuitBreakerUntil).Seconds(), 1)
+
+	// Cooldown over: the next failure is a new trip with a longer cooldown.
+	r.circuitBreakerUntil = time.Now().Add(-time.Second)
+	r.recordCreateFailure()
+	second := time.Until(r.circuitBreakerUntil)
+	assert.GreaterOrEqual(t, second, 7*time.Minute+29*time.Second) // 10m - 25%
+	assert.LessOrEqual(t, second, 12*time.Minute+30*time.Second)   // 10m + 25%
+}
+
+func TestCircuitBreaker_SuccessResetsCooldown(t *testing.T) {
+	r := newTestReconciler(t)
+	for i := 0; i < circuitBreakerThreshold; i++ {
+		r.recordCreateFailure()
+	}
+	r.circuitBreakerUntil = time.Now().Add(-time.Second)
+	r.recordCreateFailure() // second, longer trip
+
+	r.recordCreateSuccess()
+	assert.Zero(t, r.consecutiveCreateFailures)
+
+	r.circuitBreakerUntil = time.Time{}
+	for i := 0; i < circuitBreakerThreshold; i++ {
+		r.recordCreateFailure()
+	}
+	assert.LessOrEqual(t, time.Until(r.circuitBreakerUntil), 6*time.Minute+15*time.Second)
 }

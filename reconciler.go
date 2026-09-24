@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
-	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
@@ -30,9 +28,11 @@ const (
 	retryMultiplier = 2.0
 	retryJitter     = 0.25
 
-	// Circuit breaker: stop creating after N consecutive failures, cooldown before retrying
-	circuitBreakerThreshold = 3
-	circuitBreakerCooldown  = 5 * time.Minute
+	// Circuit breaker: stop creating after N consecutive failures. Cooldowns grow
+	// exponentially across consecutive trips and reset after a successful create.
+	circuitBreakerThreshold   = 3
+	circuitBreakerCooldown    = 5 * time.Minute
+	circuitBreakerMaxCooldown = 30 * time.Minute
 )
 
 // ReconcilerConfig holds configuration for the reconciliation loop.
@@ -79,6 +79,7 @@ type vcdInstanceGroup struct {
 	consecutiveCreateFailures int
 	circuitBreakerUntil       time.Time
 	cbLoggedActive            bool // avoid log spam: only log once when active
+	cbBackoff                 *backoff.ExponentialBackOff
 
 	triggerCh    chan struct{}
 	stopCh       chan struct{}
@@ -97,10 +98,50 @@ func newVCDInstanceGroup(log hclog.Logger, store *desiredStateStore, ig *Instanc
 		ig:        ig,
 		createSem: semaphore.NewWeighted(int64(config.MaxConcurrentCreates)),
 		deleteSem: semaphore.NewWeighted(int64(config.MaxConcurrentDeletes)),
+		cbBackoff: newCircuitBreakerBackOff(),
 		triggerCh: make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
 	}
+}
+
+func newCircuitBreakerBackOff() *backoff.ExponentialBackOff {
+	return backoff.NewExponentialBackOff(
+		backoff.WithInitialInterval(circuitBreakerCooldown),
+		backoff.WithMultiplier(2),
+		backoff.WithMaxInterval(circuitBreakerMaxCooldown),
+		backoff.WithRandomizationFactor(0.25),
+		backoff.WithMaxElapsedTime(0),
+	)
+}
+
+// recordCreateFailure counts a failed create and trips the breaker at the
+// threshold. Failures while the breaker is active come from creates dispatched
+// before the trip and do not lengthen the cooldown.
+func (r *vcdInstanceGroup) recordCreateFailure() {
+	r.cbMu.Lock()
+	defer r.cbMu.Unlock()
+	r.consecutiveCreateFailures++
+	if r.consecutiveCreateFailures < circuitBreakerThreshold || time.Now().Before(r.circuitBreakerUntil) {
+		return
+	}
+	cooldown := r.cbBackoff.NextBackOff()
+	r.circuitBreakerUntil = time.Now().Add(cooldown)
+	r.cbLoggedActive = false // allow one "active" log after trip
+	r.log.Warn("circuit breaker tripped, pausing creates",
+		"consecutive_failures", r.consecutiveCreateFailures,
+		"cooldown", cooldown)
+}
+
+func (r *vcdInstanceGroup) recordCreateSuccess() {
+	r.cbMu.Lock()
+	defer r.cbMu.Unlock()
+	if r.consecutiveCreateFailures > 0 {
+		r.log.Info("circuit breaker reset, create succeeded after failures",
+			"previous_failures", r.consecutiveCreateFailures)
+	}
+	r.consecutiveCreateFailures = 0
+	r.cbBackoff.Reset()
 }
 
 // Start begins the reconciliation loop.
@@ -329,16 +370,7 @@ func (r *vcdInstanceGroup) doCreate(intentID string) {
 		InstancesFailedTotal.WithLabelValues(r.store.instanceGroupName, "create").Inc()
 		r.log.Error("instance creation failed", "intentID", intentID, "error", err)
 
-		r.cbMu.Lock()
-		r.consecutiveCreateFailures++
-		if r.consecutiveCreateFailures >= circuitBreakerThreshold {
-			r.circuitBreakerUntil = time.Now().Add(circuitBreakerCooldown)
-			r.cbLoggedActive = false // allow one "active" log after trip
-			r.log.Warn("circuit breaker tripped, pausing creates",
-				"consecutive_failures", r.consecutiveCreateFailures,
-				"cooldown", circuitBreakerCooldown)
-		}
-		r.cbMu.Unlock()
+		r.recordCreateFailure()
 
 		// Back to PendingCreate with retry backoff
 		r.store.UpdateInstance(intentID, func(inst *Instance) {
@@ -353,13 +385,7 @@ func (r *vcdInstanceGroup) doCreate(intentID string) {
 		return
 	}
 
-	r.cbMu.Lock()
-	if r.consecutiveCreateFailures > 0 {
-		r.log.Info("circuit breaker reset, create succeeded after failures",
-			"previous_failures", r.consecutiveCreateFailures)
-	}
-	r.consecutiveCreateFailures = 0
-	r.cbMu.Unlock()
+	r.recordCreateSuccess()
 
 	InstancesCreatedTotal.WithLabelValues(r.store.instanceGroupName).Inc()
 
@@ -600,18 +626,19 @@ func (r *vcdInstanceGroup) Shutdown(ctx context.Context) error {
 	return r.shutdownErr
 }
 
-// retryDelay calculates the backoff delay for a given retry count.
+// retryDelay returns the backoff before retry number retryCount of an instance:
 // 10s base, 2x factor, 5min cap, 25% jitter.
 func retryDelay(retryCount int) time.Duration {
-	delay := retryBaseDelay * time.Duration(math.Pow(retryMultiplier, float64(retryCount-1)))
-	if delay > retryMaxDelay {
-		delay = retryMaxDelay
-	}
-	// Add jitter: ±25%
-	jitter := float64(delay) * retryJitter * (2*rand.Float64() - 1)
-	delay += time.Duration(jitter)
-	if delay < 0 {
-		delay = retryBaseDelay
+	b := backoff.NewExponentialBackOff(
+		backoff.WithInitialInterval(retryBaseDelay),
+		backoff.WithMultiplier(retryMultiplier),
+		backoff.WithMaxInterval(retryMaxDelay),
+		backoff.WithRandomizationFactor(retryJitter),
+		backoff.WithMaxElapsedTime(0),
+	)
+	delay := b.NextBackOff()
+	for i := 1; i < retryCount; i++ {
+		delay = b.NextBackOff()
 	}
 	return delay
 }
