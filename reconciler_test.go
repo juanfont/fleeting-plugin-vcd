@@ -349,3 +349,26 @@ func TestInstanceGroup_OwnsVApp(t *testing.T) {
 	g.failedCreateCleanups.Store("runner-2", time.Now())
 	assert.True(t, g.ownsVApp("runner-2"))
 }
+
+func TestShutdown_ReturnsWhenContextEndsDuringDelete(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	ops := &fakeOps{delete: func(string) error { <-block; return nil }}
+	log := testLogger()
+	g := &InstanceGroup{log: log, InstanceGroupName: t.Name(), VAppNamePrefix: "runner-"}
+	r := newVCDInstanceGroup(log, newDesiredStateStore(log, t.Name()), g, ReconcilerConfig{})
+	r.ops = ops
+	r.store.AddLeftover("https://vcd/vapp-1", "runner-1")
+	r.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Shutdown(ctx) }()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return after its context ended")
+	}
+}

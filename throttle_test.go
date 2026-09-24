@@ -91,3 +91,17 @@ func TestThrottleGate_NilIsNoop(t *testing.T) {
 	assert.False(t, g.paused())
 	require.NoError(t, g.wait(context.Background()))
 }
+
+func TestThrottleGate_PauseGaugeClearsWhenPauseEnds(t *testing.T) {
+	g := testGate(time.Minute)
+	g.group = t.Name()
+	now := time.Now()
+	g.now = func() time.Time { return now }
+
+	g.throttled("a")
+	assert.Equal(t, 60.0, gaugeValue(t, "fleeting_vcd_throttle_pause_seconds", t.Name()))
+
+	now = now.Add(time.Minute)
+	assert.False(t, g.paused())
+	assert.Equal(t, 0.0, gaugeValue(t, "fleeting_vcd_throttle_pause_seconds", t.Name()))
+}

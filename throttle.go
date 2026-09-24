@@ -88,7 +88,11 @@ func (g *throttleGate) paused() bool {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.now().Before(g.pausedUntil)
+	if g.now().Before(g.pausedUntil) {
+		return true
+	}
+	ThrottlePauseSeconds.WithLabelValues(g.group).Set(0)
+	return false
 }
 
 // wait blocks until no pause is active, including pauses extended while waiting.

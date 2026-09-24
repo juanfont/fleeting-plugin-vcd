@@ -77,7 +77,7 @@ var (
 
 	ThrottlePauseSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "fleeting_vcd_throttle_pause_seconds",
-		Help: "Length of the most recent pause caused by the vCD organization operation limit",
+		Help: "Length of the pause in effect because of the vCD organization operation limit; 0 once dispatch resumes",
 	}, []string{instanceGroupLabel})
 
 	APIDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{

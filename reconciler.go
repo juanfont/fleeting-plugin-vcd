@@ -583,16 +583,21 @@ func (r *vcdInstanceGroup) Shutdown(ctx context.Context) error {
 			return
 		}
 
-		// Delete all remaining instances
+		// Delete all remaining instances. vCD calls may wait out the org
+		// operation limit indefinitely, so each one is bounded by ctx.
 		r.ig.failedCreateCleanups.Range(func(key, value any) bool {
-			if err := r.ops.cleanUpInstanceByName(key.(string)); err != nil && !errors.Is(err, govcd.ErrorEntityNotFound) {
+			err := withinContext(ctx, func() error { return r.ops.cleanUpInstanceByName(key.(string)) })
+			if err != nil && !errors.Is(err, govcd.ErrorEntityNotFound) {
 				r.shutdownErr = errors.Join(r.shutdownErr, fmt.Errorf("cleanup failed create %s: %w", key, err))
 			}
-			return true
+			return ctx.Err() == nil
 		})
 		r.log.Info("cleaning up all instances")
 		instances := r.store.GetAll()
 		for _, inst := range instances {
+			if ctx.Err() != nil {
+				break
+			}
 			if inst.ID == "" || inst.Phase == PhaseDeleted {
 				continue
 			}
@@ -602,14 +607,30 @@ func (r *vcdInstanceGroup) Shutdown(ctx context.Context) error {
 				continue
 			}
 			r.log.Info("shutdown: deleting instance", "href", inst.ID, "name", inst.Name)
-			if err := r.ops.deleteInstance(inst.ID); err != nil {
+			if err := withinContext(ctx, func() error { return r.ops.deleteInstance(inst.ID) }); err != nil {
 				r.log.Error("error deleting instance during shutdown",
 					"href", inst.ID, "name", inst.Name, "error", err)
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			r.shutdownErr = errors.Join(r.shutdownErr, fmt.Errorf("cleanup interrupted: %w", err))
+		}
 	})
 
 	return r.shutdownErr
+}
+
+// withinContext runs fn but stops waiting for it when ctx ends. The vCD SDK
+// takes no context, so an abandoned call finishes in the background.
+func withinContext(ctx context.Context, fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // retryDelay returns the backoff before retry number retryCount of an instance:
