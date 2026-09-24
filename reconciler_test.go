@@ -22,7 +22,7 @@ type fakeOps struct {
 	vApps   []*govcd.VApp
 	polled  []string
 	deleted []string
-	create  func() (*createResult, error)
+	create  func(context.Context) (*createResult, error)
 	delete  func(href string) error
 	owned   map[string]bool
 
@@ -63,9 +63,9 @@ func (f *fakeOps) polledCount() int {
 	return len(f.polled)
 }
 
-func (f *fakeOps) createInstance() (*createResult, error) {
+func (f *fakeOps) createInstance(ctx context.Context) (*createResult, error) {
 	if f.create != nil {
-		return f.create()
+		return f.create(ctx)
 	}
 	return nil, errors.New("unexpected create")
 }
@@ -150,7 +150,7 @@ func queueDeletes(r *vcdInstanceGroup, n int) {
 func TestReconciler_CreatesAndDeletesShareOperationLimit(t *testing.T) {
 	b := newBlocker()
 	ops := &fakeOps{
-		create: func() (*createResult, error) { b.enter(); return nil, errors.New("boom") },
+		create: func(context.Context) (*createResult, error) { b.enter(); return nil, errors.New("boom") },
 		delete: func(string) error { b.enter(); return nil },
 	}
 	r := newFakeReconciler(t, ops, ReconcilerConfig{MaxConcurrentOperations: 4, MaxConcurrentCreates: 3, MaxConcurrentDeletes: 5})
@@ -177,7 +177,7 @@ func TestReconciler_DeleteBacklogLeavesSlotForCreates(t *testing.T) {
 	b := newBlocker()
 	created := make(chan struct{}, 1)
 	ops := &fakeOps{
-		create: func() (*createResult, error) { created <- struct{}{}; return nil, errors.New("boom") },
+		create: func(context.Context) (*createResult, error) { created <- struct{}{}; return nil, errors.New("boom") },
 		delete: func(string) error { b.enter(); return nil },
 	}
 	r := newFakeReconciler(t, ops, ReconcilerConfig{MaxConcurrentOperations: 4})
@@ -197,7 +197,10 @@ func TestReconciler_DeleteBacklogLeavesSlotForCreates(t *testing.T) {
 
 func TestReconciler_ThrottlePausePausesDispatch(t *testing.T) {
 	ops := &fakeOps{
-		create: func() (*createResult, error) { t.Error("create dispatched during pause"); return nil, errors.New("x") },
+		create: func(context.Context) (*createResult, error) {
+			t.Error("create dispatched during pause")
+			return nil, errors.New("x")
+		},
 		delete: func(string) error { t.Error("delete dispatched during pause"); return nil },
 	}
 	r := newFakeReconciler(t, ops, ReconcilerConfig{})
@@ -214,7 +217,7 @@ func TestReconciler_ThrottlePausePausesDispatch(t *testing.T) {
 }
 
 func TestReconciler_CompletedOperationResetsThrottleBackoff(t *testing.T) {
-	ops := &fakeOps{create: func() (*createResult, error) {
+	ops := &fakeOps{create: func(context.Context) (*createResult, error) {
 		return &createResult{VAppHREF: "https://vcd/vapp-1", VAppName: "runner-1"}, nil
 	}}
 	r := newFakeReconciler(t, ops, ReconcilerConfig{})
@@ -302,7 +305,7 @@ func TestPoll_DoesNotQueueVAppOfCreateInFlight(t *testing.T) {
 
 func TestCreate_RecordsHREFBeforeReleasingOwnership(t *testing.T) {
 	ops := &fakeOps{owned: map[string]bool{"runner-1": true}}
-	ops.create = func() (*createResult, error) {
+	ops.create = func(context.Context) (*createResult, error) {
 		return &createResult{VAppHREF: "https://vcd/vapp-1", VAppName: "runner-1", VMName: "vm-1"}, nil
 	}
 	r := newFakeReconciler(t, ops, ReconcilerConfig{})
@@ -365,10 +368,7 @@ func TestShutdown_ReturnsWhenContextEndsDuringDelete(t *testing.T) {
 	block := make(chan struct{})
 	defer close(block)
 	ops := &fakeOps{delete: func(string) error { <-block; return nil }}
-	log := testLogger()
-	g := &InstanceGroup{log: log, InstanceGroupName: t.Name(), VAppNamePrefix: "runner-"}
-	r := newVCDInstanceGroup(log, newDesiredStateStore(log, t.Name()), g, ReconcilerConfig{})
-	r.ops = ops
+	r := newShutdownReconciler(t, ops)
 	r.store.AddLeftover("https://vcd/vapp-1", "runner-1")
 	r.Start()
 
@@ -420,4 +420,60 @@ func TestPoll_ListFailureIsReportedAndKeepsState(t *testing.T) {
 	inst, _ := r.store.GetByVAppHREF("https://vcd/vapp-1")
 	assert.Equal(t, PhaseRunning, inst.Phase)
 	assert.Zero(t, inst.MissedPolls)
+}
+
+// newShutdownReconciler returns a reconciler with an InstanceGroup, which Shutdown needs.
+func newShutdownReconciler(t *testing.T, ops *fakeOps) *vcdInstanceGroup {
+	t.Helper()
+	log := testLogger()
+	g := &InstanceGroup{log: log, InstanceGroupName: t.Name(), VAppNamePrefix: "runner-"}
+	r := newVCDInstanceGroup(log, newDesiredStateStore(log, t.Name()), g, ReconcilerConfig{})
+	r.ops = ops
+	return r
+}
+
+func TestCreate_DeadlineReleasesSlot(t *testing.T) {
+	ops := &fakeOps{create: func(ctx context.Context) (*createResult, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	r := newFakeReconciler(t, ops, ReconcilerConfig{CreateTimeout: 30 * time.Millisecond})
+	r.store.AddCreateIntent("slow")
+	r.dispatchCreates()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, r.limiter.drain(ctx))
+	inst, _ := r.store.GetByIntentID("slow")
+	assert.Equal(t, PhasePendingCreate, inst.Phase)
+	assert.Contains(t, inst.LastError, "deadline exceeded")
+}
+
+func TestCreate_ShutdownCancelsInFlightCreate(t *testing.T) {
+	started := make(chan struct{})
+	ops := &fakeOps{create: func(ctx context.Context) (*createResult, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	r := newShutdownReconciler(t, ops)
+	r.Start() // Shutdown waits for the loop to exit
+	r.store.AddCreateIntent("slow")
+	r.dispatchCreates()
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	require.NoError(t, r.Shutdown(ctx))
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+func TestConfig_CreateTimeout(t *testing.T) {
+	g := &InstanceGroup{}
+	require.NoError(t, g.populate())
+	assert.Equal(t, defaultCreateTimeout, g.createTimeout)
+	for _, bad := range []string{"0s", "-1m", "soon"} {
+		require.Error(t, (&InstanceGroup{CreateTimeout: bad}).populate(), bad)
+	}
 }

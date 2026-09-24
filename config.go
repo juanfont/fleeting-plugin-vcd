@@ -112,6 +112,15 @@ func (g *InstanceGroup) populate() error {
 		g.sessionRefreshInterval = interval
 	}
 
+	g.createTimeout = defaultCreateTimeout
+	if g.CreateTimeout != "" {
+		d, err := time.ParseDuration(g.CreateTimeout)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("create_timeout must be a positive duration")
+		}
+		g.createTimeout = d
+	}
+
 	parsedURL, err := url.Parse(g.StrURL)
 	if err != nil {
 		return fmt.Errorf("invalid url: %s", err)

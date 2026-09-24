@@ -92,3 +92,15 @@ func (g *InstanceGroup) waitTaskCompletion(ctx context.Context, task *govcd.Task
 		}
 	}
 }
+
+// sleepContext waits for d or until ctx ends.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}

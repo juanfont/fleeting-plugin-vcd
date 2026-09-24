@@ -67,6 +67,7 @@ The plugin is configured via the GitLab Runner's `config.toml` file under `[runn
 | `max_concurrent_creates` | Maximum number of VMs being created simultaneously | `3` |
 | `max_concurrent_deletes` | Maximum number of VMs being deleted simultaneously | `5` |
 | `max_concurrent_operations` | Maximum vCD operations (creates and deletes together, including restart cleanup) in flight. One slot is always kept for creates. Keep the sum across runners sharing a vCD organization below its simultaneous-operation limit | `4` |
+| `create_timeout` | Longest a single VM create may take (Go duration) before it is abandoned, its vApp cleaned up and the create retried | `"20m"` |
 | `session_refresh_interval` | Renew the shared VCD session before API work after this interval; positive Go duration below 24h | `"20h"` |
 
 ### Example Configuration

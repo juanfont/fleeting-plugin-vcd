@@ -105,7 +105,7 @@ func TestBasicCloudDirector(t *testing.T) {
 		require.NoError(t, err)
 
 		// Create a new VM
-		result, err := ig.createInstance()
+		result, err := ig.createInstance(context.Background())
 		require.NoError(t, err)
 		require.NotNil(t, result)
 		require.NotEmpty(t, result.VAppHREF)

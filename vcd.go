@@ -68,7 +68,7 @@ type trustedPlatformModuleEdit struct {
 // and sshd is functioning. It uses the same credentials that the runner/taskscaler
 // will use (from ConnectorConfig), so if this succeeds, the runner will be able to
 // connect too.
-func (g *InstanceGroup) waitForSSHReadiness(ipAddress string) error {
+func (g *InstanceGroup) waitForSSHReadiness(ctx context.Context, ipAddress string) error {
 	port := g.settings.ProtocolPort
 	if port == 0 {
 		port = 22
@@ -110,35 +110,32 @@ func (g *InstanceGroup) waitForSSHReadiness(ipAddress string) error {
 
 	g.log.Info("waiting for SSH readiness", "addr", addr, "username", username)
 
-	deadline := time.Now().Add(sshReadinessTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sshReadinessTimeout)
+	defer cancel()
+	dialer := net.Dialer{Timeout: sshHandshakeTimeout}
 	var lastErr error
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, sshHandshakeTimeout)
-		if err != nil {
-			lastErr = err
-			g.log.Debug("SSH not reachable yet", "addr", addr, "error", err)
-			time.Sleep(sshReadinessRetryInterval)
-			continue
-		}
-
-		// TCP connected — attempt SSH handshake
-		sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
-		if err != nil {
+	for {
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			// ssh.NewClientConn takes no context; bound the handshake itself.
+			_ = conn.SetDeadline(time.Now().Add(sshHandshakeTimeout))
+			sshConn, chans, reqs, hsErr := ssh.NewClientConn(conn, addr, config)
+			if hsErr == nil {
+				ssh.NewClient(sshConn, chans, reqs).Close()
+				g.log.Info("SSH readiness check passed", "addr", addr)
+				return nil
+			}
 			conn.Close()
-			lastErr = err
+			err = hsErr
 			g.log.Debug("SSH handshake failed", "addr", addr, "error", err)
-			time.Sleep(sshReadinessRetryInterval)
-			continue
+		} else {
+			g.log.Debug("SSH not reachable yet", "addr", addr, "error", err)
 		}
-
-		// Success — clean up and return
-		client := ssh.NewClient(sshConn, chans, reqs)
-		client.Close()
-		g.log.Info("SSH readiness check passed", "addr", addr)
-		return nil
+		lastErr = err
+		if waitErr := sleepContext(ctx, sshReadinessRetryInterval); waitErr != nil {
+			return fmt.Errorf("SSH readiness check for %s: %w (last error: %v)", addr, waitErr, lastErr)
+		}
 	}
-
-	return fmt.Errorf("SSH readiness check timed out after %s for %s: %w", sshReadinessTimeout, addr, lastErr)
 }
 
 // createResult holds the result of a successful instance creation.
@@ -150,7 +147,7 @@ type createResult struct {
 	OSType    string
 }
 
-func (g *InstanceGroup) createInstance() (result *createResult, err error) {
+func (g *InstanceGroup) createInstance(ctx context.Context) (result *createResult, err error) {
 	var vAppName string
 	var completed bool
 
@@ -177,14 +174,14 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		return nil, err
 	}
 
-	org, err := safeVCDCall(context.Background(), g, "GetOrgByName", func() (*govcd.Org, error) {
+	org, err := safeVCDCall(ctx, g, "GetOrgByName", func() (*govcd.Org, error) {
 		return client.GetOrgByName(g.Org)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	vdc, err := safeVCDCall(context.Background(), g, "GetVDCByName", func() (*govcd.Vdc, error) {
+	vdc, err := safeVCDCall(ctx, g, "GetVDCByName", func() (*govcd.Vdc, error) {
 		return org.GetVDCByName(g.VirtualDatacenter, true)
 	})
 	if err != nil {
@@ -192,7 +189,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		return nil, err
 	}
 
-	tmpl, err := g.getVAppTemplate()
+	tmpl, err := g.getVAppTemplate(ctx)
 	if err != nil {
 		g.log.Error("error getting vApp template", "error", err)
 		return nil, err
@@ -200,14 +197,14 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 
 	g.log.Info("vApp template found", "vapp_template", tmpl.VAppTemplate.Name)
 
-	network, err := safeVCDCall(context.Background(), g, "GetOrgVdcNetworkByName", func() (*govcd.OrgVDCNetwork, error) {
+	network, err := safeVCDCall(ctx, g, "GetOrgVdcNetworkByName", func() (*govcd.OrgVDCNetwork, error) {
 		return vdc.GetOrgVdcNetworkByName(g.Network, true)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	storageProfile, err := g.getStorageProfile()
+	storageProfile, err := g.getStorageProfile(ctx)
 	if err != nil {
 		g.log.Error("error getting storage profile", "error", err)
 		return nil, err
@@ -228,7 +225,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 	description := fmt.Sprintf("VM created by the %s GitLab Fleeting runner", g.Name)
 
 	// Step 1: Create empty vApp (fast — returns immediately with HREF)
-	vapp, err := g.createRawVApp(context.Background(), client, vdc, vAppName, description)
+	vapp, err := g.createRawVApp(ctx, client, vdc, vAppName, description)
 	if err != nil {
 		g.log.Error("error creating empty vApp", "error", err)
 		return nil, err
@@ -237,7 +234,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 	g.log.Info("empty vApp created", "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name)
 
 	// Step 2: Add metadata tag IMMEDIATELY (fast — makes vApp visible to reconciler)
-	if err = safeVCDCallVoid(context.Background(), g, "AddMetadataEntryWithVisibility", func() error {
+	if err = safeVCDCallVoid(ctx, g, "AddMetadataEntryWithVisibility", func() error {
 		return vapp.AddMetadataEntryWithVisibility(
 			instanceGroupMetadataKey,
 			g.InstanceGroupName,
@@ -255,12 +252,12 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 	}
 
 	// Step 3: Add org network to vApp (fast — required before adding VM with network)
-	networkTask, err := singleVCDCall(context.Background(), g, "AddRAWNetworkConfig", func() (govcd.Task, error) {
+	networkTask, err := singleVCDCall(ctx, g, "AddRAWNetworkConfig", func() (govcd.Task, error) {
 		g.log.Info("adding network config to vApp", "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name, "networks", networks)
 		return vapp.AddRAWNetworkConfig(networks)
 	}, preserveVApp(vapp))
 	if err == nil {
-		err = g.waitTaskCompletion(context.Background(), &networkTask)
+		err = g.waitTaskCompletion(ctx, &networkTask)
 	}
 	if err != nil {
 		g.log.Error("error adding network config to vApp",
@@ -278,7 +275,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 	}
 
 	// TODO(juan): If we have configured a compute policy, we should use it instead of the default one.
-	computePolicy, err := g.getDefaultComputePolicy()
+	computePolicy, err := g.getDefaultComputePolicy(ctx)
 	if err != nil {
 		g.log.Warn("error getting default compute policy, using default one", "error", err)
 		computePolicy = nil
@@ -286,7 +283,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		g.log.Info("using compute policy", "compute_policy", computePolicy.Name)
 	}
 
-	addVMTask, err := singleVCDCall(context.Background(), g, "AddNewVMWithStorageProfile", func() (govcd.Task, error) {
+	addVMTask, err := singleVCDCall(ctx, g, "AddNewVMWithStorageProfile", func() (govcd.Task, error) {
 		g.log.Info("adding VM to vApp", "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name, "netSection", netSection, "storageProfile", storageProfile)
 		return vapp.AddNewVMWithComputePolicy(
 			vAppName,
@@ -303,13 +300,13 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		return nil, err
 	}
 
-	if err = g.waitTaskCompletion(context.Background(), &addVMTask); err != nil {
+	if err = g.waitTaskCompletion(ctx, &addVMTask); err != nil {
 		g.log.Error("error waiting for AddNewVMWithStorageProfile", "error", err)
 		return nil, err
 	}
 
 	// Step 5: Refresh vApp to get Children.VM[0]
-	if err = safeVCDCallVoid(context.Background(), g, "Refresh vApp after AddVM", func() error {
+	if err = safeVCDCallVoid(ctx, g, "Refresh vApp after AddVM", func() error {
 		return vapp.Refresh()
 	}, preserveVApp(vapp)); err != nil {
 		g.log.Error("error refreshing vApp after adding VM", "error", err,
@@ -335,7 +332,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		"vm", vapp.VApp.Children.VM[0].Name,
 	)
 
-	vm, err := g.waitForVMCreation(client, vapp)
+	vm, err := g.waitForVMCreation(ctx, client, vapp)
 	if err != nil {
 		return nil, err
 	}
@@ -348,24 +345,24 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 
 	g.log.Info("injecting credentials", "vm", vm.VM.Name)
 
-	err = g.injectCredentials(vm)
+	err = g.injectCredentials(ctx, vm)
 	if err != nil {
 		return nil, err
 	}
 
 	if vmRequiresTPM(vm) {
-		tpmTask, err := g.changeVMTpm(client, vm, true)
+		tpmTask, err := g.changeVMTpm(ctx, client, vm, true)
 		if err != nil {
 			return nil, err
 		}
-		if err = g.waitTaskCompletion(context.Background(), tpmTask); err != nil {
+		if err = g.waitTaskCompletion(ctx, tpmTask); err != nil {
 			return nil, err
 		}
 	}
 
 	g.log.Debug("refreshing VM", "vm", vm.VM.Name)
 
-	if err = safeVCDCallVoid(context.Background(), g, "Refresh VM", func() error {
+	if err = safeVCDCallVoid(ctx, g, "Refresh VM", func() error {
 		return vm.Refresh()
 	}, preserveVM(vm)); err != nil {
 		return nil, err
@@ -377,7 +374,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		"cpu_count", g.CPUCount, "cores_per_socket", g.CoresPerSocket,
 	)
 
-	if err = safeVCDCallVoid(context.Background(), g, "ChangeCPUAndCoreCount", func() error {
+	if err = safeVCDCallVoid(ctx, g, "ChangeCPUAndCoreCount", func() error {
 		return vm.ChangeCPUAndCoreCount(&g.CPUCount, &g.CoresPerSocket)
 	}, preserveVM(vm)); err != nil {
 		return nil, err
@@ -389,7 +386,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		"memory_mb", g.MemoryMB,
 	)
 
-	if err = safeVCDCallVoid(context.Background(), g, "ChangeMemory", func() error {
+	if err = safeVCDCallVoid(ctx, g, "ChangeMemory", func() error {
 		return vm.ChangeMemory(g.MemoryMB)
 	}, preserveVM(vm)); err != nil {
 		return nil, err
@@ -400,7 +397,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		"disk_size_gb", g.DiskSizeGB,
 	)
 
-	vm, err = g.changeDiskSize(vm)
+	vm, err = g.changeDiskSize(ctx, vm)
 	if err != nil {
 		return nil, err
 	}
@@ -409,7 +406,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		"vm", vm.VM.Name, "vapp_href", vapp.VApp.HREF, "vapp", vapp.VApp.Name,
 	)
 
-	if err = safeVCDCallVoid(context.Background(), g, "Refresh VM after disk", func() error {
+	if err = safeVCDCallVoid(ctx, g, "Refresh VM after disk", func() error {
 		return vm.Refresh()
 	}, preserveVM(vm)); err != nil {
 		return nil, err
@@ -434,7 +431,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		"ip_address", ipAddress,
 	)
 
-	powerTask, err := safeVCDCall(context.Background(), g, "PowerOn", func() (*govcd.Task, error) {
+	powerTask, err := safeVCDCall(ctx, g, "PowerOn", func() (*govcd.Task, error) {
 		t, err := vm.PowerOn()
 		if err != nil {
 			return nil, err
@@ -448,13 +445,13 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 		return nil, err
 	}
 
-	if err = g.waitTaskCompletion(context.Background(), powerTask); err != nil {
+	if err = g.waitTaskCompletion(ctx, powerTask); err != nil {
 		return nil, err
 	}
 
 	g.log.Debug("VM reported as powered on", "vm", vm.VM.Name)
 
-	vmStatus, err := safeVCDCall(context.Background(), g, "GetStatus", func() (string, error) {
+	vmStatus, err := safeVCDCall(ctx, g, "GetStatus", func() (string, error) {
 		return vm.GetStatus()
 	}, preserveVM(vm))
 	if err != nil || vmStatus != "POWERED_ON" {
@@ -463,7 +460,7 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 
 	// Verify the VM is actually reachable via SSH before declaring success.
 	// This catches VMs that boot but have broken networking, sshd not starting, etc.
-	if err := g.waitForSSHReadiness(ipAddress); err != nil {
+	if err := g.waitForSSHReadiness(ctx, ipAddress); err != nil {
 		g.log.Error("SSH readiness check failed", "error", err,
 			"vm", vm.VM.Name, "vapp_href", vapp.VApp.HREF, "ip_address", ipAddress,
 		)
@@ -789,27 +786,27 @@ func (g *InstanceGroup) deleteInstance(href string) (err error) {
 	return nil
 }
 
-func (g *InstanceGroup) getStorageProfile() (*types.Reference, error) {
+func (g *InstanceGroup) getStorageProfile(ctx context.Context) (*types.Reference, error) {
 	client, err := g.getVCDClient()
 	if err != nil {
 		return nil, err
 	}
 
-	org, err := safeVCDCall(context.Background(), g, "GetOrgByName(storage)", func() (*govcd.Org, error) {
+	org, err := safeVCDCall(ctx, g, "GetOrgByName(storage)", func() (*govcd.Org, error) {
 		return client.GetOrgByName(g.Org)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	vdc, err := safeVCDCall(context.Background(), g, "GetVDCByName(storage)", func() (*govcd.Vdc, error) {
+	vdc, err := safeVCDCall(ctx, g, "GetVDCByName(storage)", func() (*govcd.Vdc, error) {
 		return org.GetVDCByName(g.VirtualDatacenter, false)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	storageProfile, err := safeVCDCall(context.Background(), g, "FindStorageProfileReference", func() (types.Reference, error) {
+	storageProfile, err := safeVCDCall(ctx, g, "FindStorageProfileReference", func() (types.Reference, error) {
 		return vdc.FindStorageProfileReference(g.StorageProfile)
 	})
 	if err != nil {
@@ -853,7 +850,7 @@ func (g *InstanceGroup) renameVM(client *govcd.VCDClient, vm *govcd.VM, name str
 	return vm, nil
 }
 
-func (g *InstanceGroup) changeDiskSize(vm *govcd.VM) (*govcd.VM, error) {
+func (g *InstanceGroup) changeDiskSize(ctx context.Context, vm *govcd.VM) (*govcd.VM, error) {
 	if vm.VM.VmSpecSection.DiskSection == nil || len(vm.VM.VmSpecSection.DiskSection.DiskSettings) == 0 {
 		g.log.Error("disk section not found")
 		return nil, errDiskSectionNotFound
@@ -866,14 +863,14 @@ func (g *InstanceGroup) changeDiskSize(vm *govcd.VM) (*govcd.VM, error) {
 
 	g.log.Debug("changing disk size to", "size", g.DiskSizeGB)
 	vm.VM.VmSpecSection.DiskSection.DiskSettings[0].SizeMb = int64(g.DiskSizeGB) * 1024
-	vm, err := safeVCDCall(context.Background(), g, "UpdateVmSpecSection(disk)", func() (*govcd.VM, error) {
+	vm, err := safeVCDCall(ctx, g, "UpdateVmSpecSection(disk)", func() (*govcd.VM, error) {
 		return vm.UpdateVmSpecSection(vm.VM.VmSpecSection, "")
 	}, preserveVM(vm))
 	if err != nil {
 		return nil, err
 	}
 
-	if err = safeVCDCallVoid(context.Background(), g, "Refresh VM(disk)", func() error {
+	if err = safeVCDCallVoid(ctx, g, "Refresh VM(disk)", func() error {
 		return vm.Refresh()
 	}, preserveVM(vm)); err != nil {
 		return nil, err
@@ -914,34 +911,34 @@ func (g *InstanceGroup) getVMFromVAppHREF(vAppHREF string) (*govcd.VM, error) {
 	return vm, nil
 }
 
-func (g *InstanceGroup) getVAppTemplate() (*govcd.VAppTemplate, error) {
+func (g *InstanceGroup) getVAppTemplate(ctx context.Context) (*govcd.VAppTemplate, error) {
 	client, err := g.getVCDClient()
 	if err != nil {
 		return nil, err
 	}
 
-	org, err := safeVCDCall(context.Background(), g, "GetOrgByName(template)", func() (*govcd.Org, error) {
+	org, err := safeVCDCall(ctx, g, "GetOrgByName(template)", func() (*govcd.Org, error) {
 		return client.GetOrgByName(g.Org)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	catalog, err := safeVCDCall(context.Background(), g, "GetCatalogByName", func() (*govcd.Catalog, error) {
+	catalog, err := safeVCDCall(ctx, g, "GetCatalogByName", func() (*govcd.Catalog, error) {
 		return org.GetCatalogByName(g.Catalog, true)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	catalogItem, err := safeVCDCall(context.Background(), g, "GetCatalogItemByName", func() (*govcd.CatalogItem, error) {
+	catalogItem, err := safeVCDCall(ctx, g, "GetCatalogItemByName", func() (*govcd.CatalogItem, error) {
 		return catalog.GetCatalogItemByName(g.Template, true)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	tmpl, err := safeVCDCall(context.Background(), g, "GetVAppTemplate", func() (govcd.VAppTemplate, error) {
+	tmpl, err := safeVCDCall(ctx, g, "GetVAppTemplate", func() (govcd.VAppTemplate, error) {
 		return catalogItem.GetVAppTemplate()
 	})
 	if err != nil {
@@ -978,20 +975,20 @@ func (g *InstanceGroup) getVMNetworkConnectionSection() (*types.NetworkConnectio
 	return netSection, nil
 }
 
-func (g *InstanceGroup) getDefaultComputePolicy() (*types.VdcComputePolicy, error) {
+func (g *InstanceGroup) getDefaultComputePolicy(ctx context.Context) (*types.VdcComputePolicy, error) {
 	client, err := g.getVCDClient()
 	if err != nil {
 		return nil, err
 	}
 
-	org, err := safeVCDCall(context.Background(), g, "GetOrgByName(computePolicy)", func() (*govcd.Org, error) {
+	org, err := safeVCDCall(ctx, g, "GetOrgByName(computePolicy)", func() (*govcd.Org, error) {
 		return client.GetOrgByName(g.Org)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	vdc, err := safeVCDCall(context.Background(), g, "GetVDCByName(computePolicy)", func() (*govcd.Vdc, error) {
+	vdc, err := safeVCDCall(ctx, g, "GetVDCByName(computePolicy)", func() (*govcd.Vdc, error) {
 		return org.GetVDCByName(g.VirtualDatacenter, true)
 	})
 	if err != nil {
@@ -1003,7 +1000,7 @@ func (g *InstanceGroup) getDefaultComputePolicy() (*types.VdcComputePolicy, erro
 		return nil, fmt.Errorf("default compute policy not found")
 	}
 
-	computePolicy, err := safeVCDCall(context.Background(), g, "GetVdcComputePolicyById(computePolicy)", func() (*govcd.VdcComputePolicy, error) {
+	computePolicy, err := safeVCDCall(ctx, g, "GetVdcComputePolicyById(computePolicy)", func() (*govcd.VdcComputePolicy, error) {
 		return org.GetVdcComputePolicyById(defaultComputePolicy.ID)
 	})
 	if err != nil {
@@ -1013,7 +1010,7 @@ func (g *InstanceGroup) getDefaultComputePolicy() (*types.VdcComputePolicy, erro
 	return computePolicy.VdcComputePolicy, nil
 }
 
-func (g *InstanceGroup) injectCredentials(vm *govcd.VM) error {
+func (g *InstanceGroup) injectCredentials(ctx context.Context, vm *govcd.VM) error {
 	if !g.settings.UseStaticCredentials {
 		return fmt.Errorf("dynamic credentials are not supported yet")
 	}
@@ -1063,72 +1060,59 @@ func (g *InstanceGroup) injectCredentials(vm *govcd.VM) error {
 		vm.VM.GuestCustomizationSection.CustomizationScript = script.String()
 
 	}
-	return safeVCDCallVoid(context.Background(), g, "SetGuestCustomizationSection", func() error {
+	return safeVCDCallVoid(ctx, g, "SetGuestCustomizationSection", func() error {
 		_, err := vm.SetGuestCustomizationSection(vm.VM.GuestCustomizationSection)
 		return err
 	}, preserveVM(vm))
 }
 
-func (g *InstanceGroup) waitForVMCreation(client *govcd.VCDClient, vapp *govcd.VApp) (*govcd.VM, error) {
+func (g *InstanceGroup) waitForVMCreation(ctx context.Context, client *govcd.VCDClient, vapp *govcd.VApp) (*govcd.VM, error) {
 	vm := govcd.NewVM(&client.Client)
 	vm.VM.HREF = vapp.VApp.Children.VM[0].HREF
-	if err := safeVCDCallVoid(context.Background(), g, "Refresh VM(waitCreate)", func() error {
+	if err := safeVCDCallVoid(ctx, g, "Refresh VM(waitCreate)", func() error {
 		return vm.Refresh()
 	}, preserveVM(vm)); err != nil {
 		return nil, err
 	}
 
-	cWait := make(chan string, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				g.log.Error("panic in waitForVMCreation goroutine", "panic", r)
-				cWait <- "err"
-			}
-		}()
-
-		for {
-			status, _ := safeVCDCall(context.Background(), g, "GetStatus(waitCreate)", func() (string, error) {
-				return vm.GetStatus()
-			}, preserveVM(vm))
-			if status == "POWERED_OFF" {
-				break
-			}
-			time.Sleep(5 * time.Second)
+	for {
+		status, err := safeVCDCall(ctx, g, "GetStatus(waitCreate)", func() (string, error) {
+			return vm.GetStatus()
+		}, preserveVM(vm))
+		if err != nil {
+			return nil, err
 		}
-
-		for {
-			err := safeVCDCallVoid(context.Background(), g, "Refresh vApp(waitCreate)", func() error {
-				return vapp.Refresh()
-			}, preserveVApp(vapp))
-			if err != nil {
-				cWait <- "err"
-				return
-			}
-			if vapp.VApp.Tasks == nil {
-				time.Sleep(15 * time.Second) // let's give this old chap some time
-				break
-			}
-			time.Sleep(5 * time.Second)
+		if status == "POWERED_OFF" {
+			break
 		}
-
-		cWait <- "ok"
-	}()
-
-	select {
-	case res := <-cWait:
-		if res == "err" {
-			return nil, fmt.Errorf("error while deploying VM")
+		if err := sleepContext(ctx, 5*time.Second); err != nil {
+			return nil, err
 		}
-	case <-time.After(60 * time.Minute):
-		return nil, fmt.Errorf("timeout while deploying VM")
+	}
+
+	for {
+		if err := safeVCDCallVoid(ctx, g, "Refresh vApp(waitCreate)", func() error {
+			return vapp.Refresh()
+		}, preserveVApp(vapp)); err != nil {
+			return nil, err
+		}
+		if vapp.VApp.Tasks == nil {
+			break
+		}
+		if err := sleepContext(ctx, 5*time.Second); err != nil {
+			return nil, err
+		}
+	}
+	// let's give this old chap some time
+	if err := sleepContext(ctx, 15*time.Second); err != nil {
+		return nil, err
 	}
 
 	if vm.VM.VmSpecSection == nil {
 		return nil, fmt.Errorf("VM spec section not found")
 	}
 
-	if err := safeVCDCallVoid(context.Background(), g, "Refresh VM(waitCreate final)", func() error {
+	if err := safeVCDCallVoid(ctx, g, "Refresh VM(waitCreate final)", func() error {
 		return vm.Refresh()
 	}, preserveVM(vm)); err != nil {
 		return nil, err
@@ -1233,13 +1217,13 @@ func vmRequiresTPM(vm *govcd.VM) bool {
 	return false
 }
 
-func (g *InstanceGroup) changeVMTpm(client *govcd.VCDClient, vm *govcd.VM, tpmPresent bool) (*govcd.Task, error) {
+func (g *InstanceGroup) changeVMTpm(ctx context.Context, client *govcd.VCDClient, vm *govcd.VM, tpmPresent bool) (*govcd.Task, error) {
 	trustedPlatformModuleEdit := &trustedPlatformModuleEdit{
 		Xmlns:      types.XMLNamespaceVCloud,
 		TpmPresent: tpmPresent,
 	}
 
-	task, err := safeVCDCall(context.Background(), g, "ExecuteTaskRequest(TPM)", func() (govcd.Task, error) {
+	task, err := safeVCDCall(ctx, g, "ExecuteTaskRequest(TPM)", func() (govcd.Task, error) {
 		return client.Client.ExecuteTaskRequest(
 			vm.VM.HREF+"/action/editTrustedPlatformModule",
 			http.MethodPost,

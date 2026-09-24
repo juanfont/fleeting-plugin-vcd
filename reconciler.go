@@ -19,6 +19,7 @@ const (
 	defaultMaxConcurrentCreates    = 3
 	defaultMaxConcurrentDeletes    = 5
 	defaultMaxConcurrentOperations = 4
+	defaultCreateTimeout           = 20 * time.Minute
 	defaultMaxInstanceAge          = 24 * time.Hour
 	gcCheckEveryN                  = 360 // ~1h at 10s interval
 
@@ -43,6 +44,7 @@ type ReconcilerConfig struct {
 	Interval                time.Duration
 	MaxInstanceAge          time.Duration
 	PollReadTimeout         time.Duration
+	CreateTimeout           time.Duration
 }
 
 func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
@@ -65,6 +67,9 @@ func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
 	if out.PollReadTimeout <= 0 {
 		out.PollReadTimeout = pollReadTimeout
 	}
+	if out.CreateTimeout <= 0 {
+		out.CreateTimeout = defaultCreateTimeout
+	}
 	return out
 }
 
@@ -73,7 +78,7 @@ func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
 type vcdOps interface {
 	getInstancesInInstanceGroup(ctx context.Context) ([]*govcd.VApp, error)
 	pollVM(ctx context.Context, vmHREF string) (*vmPollResult, error)
-	createInstance() (*createResult, error)
+	createInstance(ctx context.Context) (*createResult, error)
 	deleteInstance(href string) error
 	cleanUpInstanceByName(name string) error
 	ownsVApp(name string) bool
@@ -356,7 +361,10 @@ func (r *vcdInstanceGroup) dispatchCreates() {
 func (r *vcdInstanceGroup) doCreate(intentID string) {
 	startTime := time.Now()
 
-	result, err := r.ops.createInstance()
+	// A create that never returns would hold its slot forever; bound it.
+	ctx, cancel := context.WithTimeout(r.ctx, r.config.CreateTimeout)
+	defer cancel()
+	result, err := r.ops.createInstance(ctx)
 	duration := time.Since(startTime).Seconds()
 	InstanceCreationDuration.WithLabelValues(r.store.instanceGroupName).Observe(duration)
 
@@ -582,6 +590,8 @@ func (r *vcdInstanceGroup) Shutdown(ctx context.Context) error {
 
 		// Stop the reconciliation loop
 		close(r.stopCh)
+		// End in-flight creates now; drain below waits for them to return.
+		r.cancel()
 
 		// Wait for the loop to exit
 		select {
