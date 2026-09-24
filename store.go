@@ -171,6 +171,31 @@ func (s *desiredStateStore) AddPreexisting(href, vappName, vmName, ipAddress, va
 	s.byVAppHREF[href] = inst
 }
 
+// AddLeftover queues a vApp this process does not own for deletion. It returns
+// false when the HREF is already tracked.
+func (s *desiredStateStore) AddLeftover(href, vappName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.byVAppHREF[href]; ok {
+		return false
+	}
+
+	now := time.Now()
+	inst := &Instance{
+		ID:                href,
+		IntentID:          href,
+		Name:              vappName,
+		Phase:             PhasePendingDelete,
+		Leftover:          true,
+		DeleteRequestedAt: &now,
+		LastUpdated:       &now,
+	}
+	s.instances[href] = inst
+	s.byVAppHREF[href] = inst
+	return true
+}
+
 // UpdateFromVCD updates an instance's observed state from VCD polling data.
 // Returns false if the instance is not tracked.
 func (s *desiredStateStore) UpdateFromVCD(href, vappName, vmName, ipAddress, vappStatus, vmStatus, osType string) bool {

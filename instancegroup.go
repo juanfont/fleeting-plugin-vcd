@@ -38,11 +38,11 @@ func (p Phase) String() string {
 
 // Instance represents a tracked VCD instance with its full lifecycle state.
 type Instance struct {
-	ID       string // VApp HREF (empty until VApp created)
-	IntentID string // UUID, assigned at Increase time
-	Name     string // VApp name
-	VMName   string
-	Phase    Phase
+	ID         string // VApp HREF (empty until VApp created)
+	IntentID   string // UUID, assigned at Increase time
+	Name       string // VApp name
+	VMName     string
+	Phase      Phase
 	IPAddress  string
 	VAppStatus string
 	VMStatus   string
@@ -66,6 +66,11 @@ type Instance struct {
 	// MissedPolls tracks how many consecutive polls this instance was not found in VCD.
 	// Used to avoid marking instances as disappeared due to eventual consistency.
 	MissedPolls int
+
+	// Leftover marks a vApp found in vCD that this process did not create (for
+	// example from before a restart). It is deleted through the normal queue and
+	// never reported to taskscaler.
+	Leftover bool
 }
 
 // VCDInstanceGroup manages a group of VCD instances with reconciliation.

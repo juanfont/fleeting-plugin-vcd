@@ -674,3 +674,17 @@ func TestStore_FullLifecycle(t *testing.T) {
 	s.Prune()
 	assert.Len(t, s.GetAll(), 0)
 }
+
+func TestStore_AddLeftover(t *testing.T) {
+	s := newTestStore()
+	require.True(t, s.AddLeftover("https://vcd/vapp-1", "runner-1"))
+	require.False(t, s.AddLeftover("https://vcd/vapp-1", "runner-1"), "already tracked")
+
+	inst, ok := s.GetByVAppHREF("https://vcd/vapp-1")
+	require.True(t, ok)
+	assert.True(t, inst.Leftover)
+	assert.Equal(t, PhasePendingDelete, inst.Phase)
+	assert.Equal(t, "runner-1", inst.Name)
+	assert.Nil(t, inst.CreatedAt)
+	assert.Len(t, s.GetPendingDeletes(), 1)
+}

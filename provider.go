@@ -40,6 +40,9 @@ type InstanceGroup struct {
 	// throttle is shared with the reconciler; vCD calls report operation-limit
 	// rejections to it and wait out its pause. Nil disables throttling.
 	throttle *throttleGate
+	// inflightCreates holds names of vApps whose create has started but whose
+	// HREF the reconciler has not stored yet (vApp name -> struct{}).
+	inflightCreates sync.Map
 
 	// Cloud Director connection config
 	StrURL                  string `json:"url"`
@@ -156,7 +159,7 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 
 	size := 0
 	for _, inst := range instances {
-		if inst.Phase == PhaseDeleted {
+		if inst.Phase == PhaseDeleted || inst.Leftover {
 			continue
 		}
 

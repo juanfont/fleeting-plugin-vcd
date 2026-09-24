@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vmware/go-vcloud-director/v3/govcd"
 	"github.com/vmware/go-vcloud-director/v3/types/v56"
+	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
 
 type fakeOps struct {
@@ -23,6 +24,7 @@ type fakeOps struct {
 	deleted []string
 	create  func() (*createResult, error)
 	delete  func(href string) error
+	owned   map[string]bool
 }
 
 func (f *fakeOps) getInstancesInInstanceGroup() ([]*govcd.VApp, error) {
@@ -69,6 +71,18 @@ func (f *fakeOps) deleteInstance(href string) error {
 
 func (f *fakeOps) cleanUpInstanceByName(name string) error {
 	return f.deleteInstance("name:" + name)
+}
+
+func (f *fakeOps) ownsVApp(name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.owned[name]
+}
+
+func (f *fakeOps) createRecorded(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.owned, name)
 }
 
 func newFakeReconciler(t *testing.T, ops *fakeOps, config ReconcilerConfig) *vcdInstanceGroup {
@@ -240,4 +254,98 @@ func TestConfig_MaxConcurrentOperationsDefault(t *testing.T) {
 	g := &InstanceGroup{}
 	require.NoError(t, g.populate())
 	assert.Equal(t, defaultMaxConcurrentOperations, g.MaxConcurrentOperations)
+}
+
+func TestPoll_QueuesLeftoversThroughLimiter(t *testing.T) {
+	b := newBlocker()
+	ops := &fakeOps{delete: func(string) error { b.enter(); return nil }}
+	var vApps []*govcd.VApp
+	for i := 0; i < 50; i++ {
+		vApps = append(vApps, testVApp(i, i%10 == 0))
+	}
+	ops.setVApps(vApps)
+	r := newFakeReconciler(t, ops, ReconcilerConfig{MaxConcurrentOperations: 4})
+
+	r.pollVCD()
+	assert.Zero(t, ops.polledCount(), "leftovers must not cost a VM read")
+	assert.Len(t, r.store.GetPendingDeletes(), 50)
+	assert.Zero(t, b.inFlight.Load(), "polling must not start deletes")
+
+	r.dispatchDeletes()
+	require.Eventually(t, func() bool { return b.inFlight.Load() == 3 }, time.Second, 5*time.Millisecond)
+	r.pollVCD()
+	r.dispatchDeletes()
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, int32(3), b.peak.Load())
+	close(b.release)
+}
+
+func TestPoll_DoesNotQueueVAppOfCreateInFlight(t *testing.T) {
+	ops := &fakeOps{owned: map[string]bool{"runner-1": true, "runner-2": true}}
+	ops.setVApps([]*govcd.VApp{testVApp(1, true), testVApp(2, false)})
+	r := newFakeReconciler(t, ops, ReconcilerConfig{})
+
+	r.pollVCD()
+	assert.Empty(t, r.store.GetAll())
+}
+
+func TestCreate_RecordsHREFBeforeReleasingOwnership(t *testing.T) {
+	ops := &fakeOps{owned: map[string]bool{"runner-1": true}}
+	ops.create = func() (*createResult, error) {
+		return &createResult{VAppHREF: "https://vcd/vapp-1", VAppName: "runner-1", VMName: "vm-1"}, nil
+	}
+	r := newFakeReconciler(t, ops, ReconcilerConfig{})
+	r.store.AddCreateIntent("intent")
+
+	r.doCreate("intent")
+	assert.False(t, ops.ownsVApp("runner-1"))
+
+	ops.setVApps([]*govcd.VApp{testVApp(1, false)})
+	r.pollVCD()
+	inst, ok := r.store.GetByVAppHREF("https://vcd/vapp-1")
+	require.True(t, ok)
+	assert.Equal(t, "intent", inst.IntentID)
+	assert.False(t, inst.Leftover)
+	assert.Len(t, r.store.GetAll(), 1)
+}
+
+func TestPoll_LeftoverRemovedElsewhereIsMarkedDeleted(t *testing.T) {
+	ops := &fakeOps{}
+	ops.setVApps([]*govcd.VApp{testVApp(1, false), testVApp(2, false)})
+	r := newFakeReconciler(t, ops, ReconcilerConfig{})
+	r.pollVCD()
+
+	ops.setVApps([]*govcd.VApp{testVApp(2, false)})
+	for i := 0; i < missedPollsBeforeDisappeared; i++ {
+		r.pollVCD()
+	}
+	inst, _ := r.store.GetByVAppHREF("https://vcd/vapp-1")
+	assert.Equal(t, PhaseDeleted, inst.Phase)
+}
+
+func TestUpdate_HidesLeftovers(t *testing.T) {
+	ops := &fakeOps{}
+	ops.setVApps([]*govcd.VApp{testVApp(1, false)})
+	r := newFakeReconciler(t, ops, ReconcilerConfig{})
+	g := &InstanceGroup{log: testLogger(), InstanceGroupName: t.Name(), ig: r}
+	r.pollVCD()
+
+	var reported []string
+	require.NoError(t, g.Update(context.Background(), func(id string, _ provider.State) {
+		reported = append(reported, id)
+	}))
+	assert.Empty(t, reported)
+}
+
+func TestInstanceGroup_OwnsVApp(t *testing.T) {
+	g := &InstanceGroup{}
+	assert.False(t, g.ownsVApp("runner-1"))
+
+	g.inflightCreates.Store("runner-1", struct{}{})
+	assert.True(t, g.ownsVApp("runner-1"))
+	g.createRecorded("runner-1")
+	assert.False(t, g.ownsVApp("runner-1"))
+
+	g.failedCreateCleanups.Store("runner-2", time.Now())
+	assert.True(t, g.ownsVApp("runner-2"))
 }

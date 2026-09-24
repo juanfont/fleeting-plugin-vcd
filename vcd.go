@@ -158,6 +158,8 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 				"error", err,
 			)
 			g.failedCreateCleanups.LoadOrStore(vAppName, time.Now())
+			// Ownership passes to the failed-create cleanup.
+			g.inflightCreates.Delete(vAppName)
 		}
 	}()
 
@@ -206,6 +208,9 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 	if err != nil {
 		return nil, err
 	}
+	// Discovery must not treat this vApp as a leftover until the reconciler
+	// has stored its HREF (see createRecorded).
+	g.inflightCreates.Store(vAppName, struct{}{})
 
 	g.log.Info("Creating a new vApp", "vapp", vAppName, "template", tmpl.VAppTemplate.Name)
 	networks := []*types.OrgVDCNetwork{}
@@ -579,6 +584,21 @@ func (g *InstanceGroup) pollVM(vmHREF string) (*vmPollResult, error) {
 		}
 		return &vmPollResult{IP: ip, OSType: osType}, nil
 	})
+}
+
+// ownsVApp reports whether a vApp belongs to a create that is still in flight
+// or awaiting failed-create cleanup, so discovery must not treat it as a leftover.
+func (g *InstanceGroup) ownsVApp(name string) bool {
+	if _, ok := g.inflightCreates.Load(name); ok {
+		return true
+	}
+	_, ok := g.failedCreateCleanups.Load(name)
+	return ok
+}
+
+// createRecorded releases ownership once the reconciler has stored the HREF.
+func (g *InstanceGroup) createRecorded(name string) {
+	g.inflightCreates.Delete(name)
 }
 
 func (g *InstanceGroup) cleanUpInstanceByName(name string) error {

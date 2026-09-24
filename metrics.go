@@ -124,4 +124,9 @@ var (
 		Name: "fleeting_vcd_last_reconcile_timestamp_seconds",
 		Help: "Unix time the last reconciliation cycle finished; alert when it stops advancing",
 	}, []string{instanceGroupLabel})
+
+	LeftoverVAppsQueuedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fleeting_vcd_leftover_vapps_queued_total",
+		Help: "Total number of vApps not owned by this process that were queued for deletion",
+	}, []string{instanceGroupLabel})
 )

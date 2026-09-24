@@ -72,6 +72,8 @@ type vcdOps interface {
 	createInstance() (*createResult, error)
 	deleteInstance(href string) error
 	cleanUpInstanceByName(name string) error
+	ownsVApp(name string) bool
+	createRecorded(name string)
 }
 
 // vcdInstanceGroup implements VCDInstanceGroup using a reconciliation loop.
@@ -85,8 +87,8 @@ type vcdInstanceGroup struct {
 	limiter  *opLimiter
 	throttle *throttleGate
 
-	// backgroundDeletes tracks HREFs with in-flight background delete goroutines
-	// (orphan/preexisting cleanup) to avoid firing duplicates on every poll.
+	// backgroundDeletes tracks failed-create cleanups in flight to avoid
+	// starting duplicates on every cycle.
 	backgroundDeletes sync.Map
 
 	// Circuit breaker: stop dispatching creates after consecutive failures.
@@ -252,41 +254,37 @@ func (r *vcdInstanceGroup) pollVCD() {
 
 	for _, vapp := range vApps {
 		href := vapp.VApp.HREF
+		name := vapp.VApp.Name
 		knownHREFs[href] = true // Always track to prevent false disappearance
+		vappStatus := types.VAppStatuses[vapp.VApp.Status]
+
+		inst, tracked := r.store.GetByVAppHREF(href)
+		if !tracked {
+			// A create in flight links its own vApp once it stores the HREF.
+			if r.ops.ownsVApp(name) {
+				continue
+			}
+			if r.store.AddLeftover(href, name) {
+				LeftoverVAppsQueuedTotal.WithLabelValues(r.store.instanceGroupName).Inc()
+				r.log.Warn("queueing leftover vApp for deletion", "href", href, "vapp", name)
+			}
+			continue
+		}
 
 		hasVM := vapp.VApp.Children != nil && len(vapp.VApp.Children.VM) > 0
-
-		if hasVM {
-			vmName := vapp.VApp.Children.VM[0].Name
-			vappStatus := types.VAppStatuses[vapp.VApp.Status]
-			vmStatus := types.VAppStatuses[vapp.VApp.Children.VM[0].Status]
-
-			// Try to get IP address and OS type from the VM
-			vmHREF := vapp.VApp.Children.VM[0].HREF
-			pollResult, err := r.ops.pollVM(vmHREF)
-
-			var ipAddress, osType string
-			if err == nil && pollResult != nil {
-				ipAddress = pollResult.IP
-				osType = pollResult.OSType
-			}
-
-			// Update existing instance, or auto-delete if not tracked.
-			// Skip deletion when there are in-flight creates, because the VApp
-			// is almost certainly from one of our create workers — not truly preexisting.
-			// It will be properly linked when doCreate calls UpdateInstance with the HREF.
-			if !r.store.UpdateFromVCD(href, vapp.VApp.Name, vmName, ipAddress, vappStatus, vmStatus, osType) {
-				if !r.store.HasCreating() {
-					r.backgroundDelete(href, "preexisting vApp (leftover from previous run)")
-				}
-			}
-		} else {
-			// Empty vApp (in-flight creation or orphan) — update if tracked, but don't add as preexisting
-			vappStatus := types.VAppStatuses[vapp.VApp.Status]
-			if !r.store.UpdateFromVCD(href, vapp.VApp.Name, "", "", vappStatus, "", "") && !r.store.HasCreating() {
-				r.backgroundDelete(href, "orphaned empty vApp")
-			}
+		if inst.Leftover || !hasVM {
+			// Leftovers only wait for deletion; skip the per-VM read.
+			r.store.UpdateFromVCD(href, name, "", "", vappStatus, "", "")
+			continue
 		}
+
+		vm := vapp.VApp.Children.VM[0]
+		var ipAddress, osType string
+		if pollResult, err := r.ops.pollVM(vm.HREF); err == nil && pollResult != nil {
+			ipAddress = pollResult.IP
+			osType = pollResult.OSType
+		}
+		r.store.UpdateFromVCD(href, name, vm.Name, ipAddress, vappStatus, types.VAppStatuses[vm.Status], osType)
 	}
 
 	// Mark disappeared instances — but only if the poll actually returned results.
@@ -303,28 +301,6 @@ func (r *vcdInstanceGroup) pollVCD() {
 type vmPollResult struct {
 	IP     string
 	OSType string
-}
-
-// backgroundDelete fires a goroutine to delete a vApp that is not tracked in the store
-// (preexisting or orphaned). It deduplicates by HREF and recovers from panics.
-func (r *vcdInstanceGroup) backgroundDelete(href, reason string) {
-	if _, loaded := r.backgroundDeletes.LoadOrStore(href, true); loaded {
-		return // already in-flight
-	}
-
-	r.log.Warn("deleting "+reason, "href", href)
-	go func() {
-		defer r.backgroundDeletes.Delete(href)
-		defer func() {
-			if rec := recover(); rec != nil {
-				r.log.Error("panic in background delete", "href", href, "panic", rec)
-			}
-		}()
-
-		if err := r.ops.deleteInstance(href); err != nil {
-			r.log.Error("background delete failed", "href", href, "error", err)
-		}
-	}()
 }
 
 func (r *vcdInstanceGroup) dispatchCreates() {
@@ -406,6 +382,9 @@ func (r *vcdInstanceGroup) doCreate(intentID string) {
 		inst.LastError = ""
 		inst.NextRetryAfter = nil
 	})
+
+	// The store now knows the HREF, so discovery links the vApp to this intent.
+	r.ops.createRecorded(result.VAppName)
 
 	r.log.Info("instance created successfully",
 		"intentID", intentID,
