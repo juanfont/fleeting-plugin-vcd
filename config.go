@@ -121,6 +121,15 @@ func (g *InstanceGroup) populate() error {
 		g.createTimeout = d
 	}
 
+	g.startupCleanupTimeout = defaultStartupCleanupTimeout
+	if g.StartupCleanupTimeout != "" {
+		d, err := time.ParseDuration(g.StartupCleanupTimeout)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("startup_cleanup_timeout must be a positive duration")
+		}
+		g.startupCleanupTimeout = d
+	}
+
 	parsedURL, err := url.Parse(g.StrURL)
 	if err != nil {
 		return fmt.Errorf("invalid url: %s", err)

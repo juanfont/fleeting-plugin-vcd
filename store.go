@@ -196,6 +196,20 @@ func (s *desiredStateStore) AddLeftover(href, vappName string) bool {
 	return true
 }
 
+// LeftoverCount returns how many leftover vApps are not yet deleted.
+func (s *desiredStateStore) LeftoverCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	count := 0
+	for _, inst := range s.instances {
+		if inst.Leftover && inst.Phase != PhaseDeleted {
+			count++
+		}
+	}
+	return count
+}
+
 // UpdateFromVCD updates an instance's observed state from VCD polling data.
 // Returns false if the instance is not tracked.
 func (s *desiredStateStore) UpdateFromVCD(href, vappName, vmName, ipAddress, vappStatus, vmStatus, osType string) bool {

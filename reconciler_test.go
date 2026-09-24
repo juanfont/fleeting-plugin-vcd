@@ -101,6 +101,7 @@ func newFakeReconciler(t *testing.T, ops *fakeOps, config ReconcilerConfig) *vcd
 	log := testLogger()
 	r := newVCDInstanceGroup(log, newDesiredStateStore(log, t.Name()), nil, config)
 	r.ops = ops
+	r.endStartupHold()
 	return r
 }
 
@@ -429,6 +430,7 @@ func newShutdownReconciler(t *testing.T, ops *fakeOps) *vcdInstanceGroup {
 	g := &InstanceGroup{log: log, InstanceGroupName: t.Name(), VAppNamePrefix: "runner-"}
 	r := newVCDInstanceGroup(log, newDesiredStateStore(log, t.Name()), g, ReconcilerConfig{})
 	r.ops = ops
+	r.endStartupHold()
 	return r
 }
 
@@ -475,5 +477,114 @@ func TestConfig_CreateTimeout(t *testing.T) {
 	assert.Equal(t, defaultCreateTimeout, g.createTimeout)
 	for _, bad := range []string{"0s", "-1m", "soon"} {
 		require.Error(t, (&InstanceGroup{CreateTimeout: bad}).populate(), bad)
+	}
+}
+
+// newHeldReconciler returns a reconciler as it is right after a start.
+func newHeldReconciler(t *testing.T, ops *fakeOps, config ReconcilerConfig) *vcdInstanceGroup {
+	t.Helper()
+	log := testLogger()
+	r := newVCDInstanceGroup(log, newDesiredStateStore(log, t.Name()), nil, config)
+	r.ops = ops
+	return r
+}
+
+func countingCreate(n *atomic.Int32) func(context.Context) (*createResult, error) {
+	return func(context.Context) (*createResult, error) {
+		n.Add(1)
+		return nil, errors.New("stop here")
+	}
+}
+
+func TestStartup_HoldsCreatesUntilLeftoversDeleted(t *testing.T) {
+	var creates atomic.Int32
+	release := make(chan struct{})
+	ops := &fakeOps{create: countingCreate(&creates), delete: func(string) error { <-release; return nil }}
+	ops.setVApps([]*govcd.VApp{testVApp(1, false), testVApp(2, false)})
+	r := newHeldReconciler(t, ops, ReconcilerConfig{})
+	r.store.AddCreateIntent("new")
+
+	r.reconcileOnce(false)
+	time.Sleep(20 * time.Millisecond)
+	assert.Zero(t, creates.Load(), "creates must wait for startup cleanup")
+
+	close(release)
+	require.Eventually(t, func() bool { return r.store.LeftoverCount() == 0 }, time.Second, 5*time.Millisecond)
+	ops.setVApps(nil)
+	r.reconcileOnce(false)
+	require.Eventually(t, func() bool { return creates.Load() == 1 }, time.Second, 5*time.Millisecond)
+}
+
+func TestStartup_DeletesUseEverySlotDuringHold(t *testing.T) {
+	b := newBlocker()
+	ops := &fakeOps{delete: func(string) error { b.enter(); return nil }}
+	var vApps []*govcd.VApp
+	for i := 0; i < 10; i++ {
+		vApps = append(vApps, testVApp(i, false))
+	}
+	ops.setVApps(vApps)
+	r := newHeldReconciler(t, ops, ReconcilerConfig{MaxConcurrentOperations: 4})
+
+	r.reconcileOnce(false)
+	require.Eventually(t, func() bool { return b.inFlight.Load() == 4 }, time.Second, 5*time.Millisecond)
+	close(b.release)
+}
+
+func TestStartup_NoLeftoversEndsHoldAtOnce(t *testing.T) {
+	var creates atomic.Int32
+	ops := &fakeOps{create: countingCreate(&creates)}
+	r := newHeldReconciler(t, ops, ReconcilerConfig{})
+	r.store.AddCreateIntent("new")
+
+	r.reconcileOnce(false)
+	require.Eventually(t, func() bool { return creates.Load() == 1 }, time.Second, 5*time.Millisecond)
+}
+
+func TestStartup_FailedFirstPollKeepsHold(t *testing.T) {
+	var creates atomic.Int32
+	ops := &fakeOps{listErr: errors.New("vCD unreachable"), create: countingCreate(&creates)}
+	r := newHeldReconciler(t, ops, ReconcilerConfig{})
+	r.store.AddCreateIntent("new")
+
+	r.reconcileOnce(false)
+	r.reconcileOnce(false)
+	time.Sleep(20 * time.Millisecond)
+	assert.Zero(t, creates.Load())
+	assert.True(t, r.startupHold)
+}
+
+func TestStartup_TimeoutReleasesHold(t *testing.T) {
+	var creates atomic.Int32
+	ops := &fakeOps{create: countingCreate(&creates), delete: func(string) error { return errors.New("vApp has 2 VMs") }}
+	ops.setVApps([]*govcd.VApp{testVApp(1, false)})
+	r := newHeldReconciler(t, ops, ReconcilerConfig{StartupCleanupTimeout: time.Hour})
+	r.store.AddCreateIntent("new")
+
+	r.reconcileOnce(false)
+	assert.True(t, r.startupHold)
+
+	r.startedAt = time.Now().Add(-2 * time.Hour)
+	r.reconcileOnce(false)
+	require.Eventually(t, func() bool { return creates.Load() == 1 }, time.Second, 5*time.Millisecond)
+}
+
+func TestStartup_LaterLeftoversDoNotHoldCreates(t *testing.T) {
+	var creates atomic.Int32
+	ops := &fakeOps{create: countingCreate(&creates), delete: func(string) error { select {} }}
+	r := newHeldReconciler(t, ops, ReconcilerConfig{})
+	r.reconcileOnce(false) // empty group: hold ends
+
+	ops.setVApps([]*govcd.VApp{testVApp(1, false)})
+	r.store.AddCreateIntent("new")
+	r.reconcileOnce(false)
+	require.Eventually(t, func() bool { return creates.Load() == 1 }, time.Second, 5*time.Millisecond)
+}
+
+func TestConfig_StartupCleanupTimeout(t *testing.T) {
+	g := &InstanceGroup{}
+	require.NoError(t, g.populate())
+	assert.Equal(t, defaultStartupCleanupTimeout, g.startupCleanupTimeout)
+	for _, bad := range []string{"0s", "-1m", "later"} {
+		require.Error(t, (&InstanceGroup{StartupCleanupTimeout: bad}).populate(), bad)
 	}
 }

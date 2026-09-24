@@ -66,6 +66,8 @@ type InstanceGroup struct {
 	MaxConcurrentOperations int    `json:"max_concurrent_operations"`
 	CreateTimeout           string `json:"create_timeout"`
 	createTimeout           time.Duration
+	StartupCleanupTimeout   string `json:"startup_cleanup_timeout"`
+	startupCleanupTimeout   time.Duration
 	SessionRefreshInterval  string `json:"session_refresh_interval"`
 
 	parsedURL *url.URL
@@ -105,6 +107,7 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 		MaxConcurrentDeletes:    g.MaxConcurrentDeletes,
 		MaxConcurrentOperations: g.MaxConcurrentOperations,
 		CreateTimeout:           g.createTimeout,
+		StartupCleanupTimeout:   g.startupCleanupTimeout,
 	}
 	reconciler := newVCDInstanceGroup(g.log, g.store, g, config)
 	reconciler.Start()

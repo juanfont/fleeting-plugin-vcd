@@ -688,3 +688,14 @@ func TestStore_AddLeftover(t *testing.T) {
 	assert.Nil(t, inst.CreatedAt)
 	assert.Len(t, s.GetPendingDeletes(), 1)
 }
+
+func TestStore_LeftoverCount(t *testing.T) {
+	s := newTestStore()
+	s.AddLeftover("https://vcd/vapp-1", "runner-1")
+	s.AddLeftover("https://vcd/vapp-2", "runner-2")
+	s.AddCreateIntent("intent")
+	assert.Equal(t, 2, s.LeftoverCount())
+
+	s.UpdateInstance("https://vcd/vapp-1", func(inst *Instance) { inst.Phase = PhaseDeleted })
+	assert.Equal(t, 1, s.LeftoverCount())
+}

@@ -20,6 +20,7 @@ const (
 	defaultMaxConcurrentDeletes    = 5
 	defaultMaxConcurrentOperations = 4
 	defaultCreateTimeout           = 20 * time.Minute
+	defaultStartupCleanupTimeout   = 30 * time.Minute
 	defaultMaxInstanceAge          = 24 * time.Hour
 	gcCheckEveryN                  = 360 // ~1h at 10s interval
 
@@ -45,6 +46,7 @@ type ReconcilerConfig struct {
 	MaxInstanceAge          time.Duration
 	PollReadTimeout         time.Duration
 	CreateTimeout           time.Duration
+	StartupCleanupTimeout   time.Duration
 }
 
 func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
@@ -69,6 +71,9 @@ func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
 	}
 	if out.CreateTimeout <= 0 {
 		out.CreateTimeout = defaultCreateTimeout
+	}
+	if out.StartupCleanupTimeout <= 0 {
+		out.StartupCleanupTimeout = defaultStartupCleanupTimeout
 	}
 	return out
 }
@@ -100,6 +105,14 @@ type vcdInstanceGroup struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// Creates are held after a start until the vApps left by the previous run
+	// are deleted, so the old pool's storage and operations are free first.
+	// Only the reconcile goroutine touches these.
+	startupHold   bool
+	startupPolled bool
+	holdLogged    bool
+	startedAt     time.Time
+
 	// backgroundDeletes tracks failed-create cleanups in flight to avoid
 	// starting duplicates on every cycle.
 	backgroundDeletes sync.Map
@@ -124,19 +137,23 @@ func newVCDInstanceGroup(log hclog.Logger, store *desiredStateStore, ig *Instanc
 	ctx, cancel := context.WithCancel(context.Background())
 
 	r := &vcdInstanceGroup{
-		ctx:       ctx,
-		cancel:    cancel,
-		log:       log,
-		store:     store,
-		config:    config,
-		ig:        ig,
-		limiter:   newOpLimiter(config.MaxConcurrentOperations, config.MaxConcurrentCreates, config.MaxConcurrentDeletes, throttle),
-		throttle:  throttle,
-		cbBackoff: newCircuitBreakerBackOff(),
-		triggerCh: make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
+		startupHold: true,
+		startedAt:   time.Now(),
+		log:         log,
+		store:       store,
+		config:      config,
+		ig:          ig,
+		limiter:     newOpLimiter(config.MaxConcurrentOperations, config.MaxConcurrentCreates, config.MaxConcurrentDeletes, throttle),
+		throttle:    throttle,
+		cbBackoff:   newCircuitBreakerBackOff(),
+		triggerCh:   make(chan struct{}, 1),
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
 	}
+	// Teardown may use every slot while creates are held.
+	r.limiter.setCreateReserve(false)
 	if ig != nil {
 		// vCD calls report throttling to the same gate that pauses dispatch.
 		ig.throttle = throttle
@@ -237,9 +254,11 @@ func (r *vcdInstanceGroup) reconcileOnce(doGC bool) {
 	}()
 
 	// Step 1: Poll VCD and update cache
-	if err := r.pollVCD(); err != nil {
-		r.log.Error("error polling VCD", "error", err)
+	pollErr := r.pollVCD()
+	if pollErr != nil {
+		r.log.Error("error polling VCD", "error", pollErr)
 	}
+	r.updateStartupHold(pollErr == nil)
 
 	// Step 2: Dispatch pending creates
 	r.dispatchCreates()
@@ -324,6 +343,14 @@ type vmPollResult struct {
 }
 
 func (r *vcdInstanceGroup) dispatchCreates() {
+	if r.startupHold {
+		if !r.holdLogged {
+			r.log.Info("holding creates until leftover vApps from the previous run are deleted",
+				"leftovers", r.store.LeftoverCount())
+			r.holdLogged = true
+		}
+		return
+	}
 	r.cbMu.Lock()
 	if r.consecutiveCreateFailures >= circuitBreakerThreshold && time.Now().Before(r.circuitBreakerUntil) {
 		if !r.cbLoggedActive {
@@ -356,6 +383,34 @@ func (r *vcdInstanceGroup) dispatchCreates() {
 			r.doCreate(intentID)
 		}()
 	}
+}
+
+// updateStartupHold ends the startup hold once a successful poll has run and
+// every leftover it found is deleted, or when startup cleanup takes too long
+// (for example a vApp whose delete keeps failing).
+func (r *vcdInstanceGroup) updateStartupHold(pollOK bool) {
+	if !r.startupHold {
+		return
+	}
+	if pollOK {
+		r.startupPolled = true
+	}
+	remaining := r.store.LeftoverCount()
+	switch {
+	case r.startupPolled && remaining == 0:
+		r.log.Info("startup cleanup complete, creating instances")
+	case time.Since(r.startedAt) >= r.config.StartupCleanupTimeout:
+		r.log.Warn("startup cleanup timed out, creating instances anyway",
+			"leftovers_remaining", remaining, "timeout", r.config.StartupCleanupTimeout)
+	default:
+		return
+	}
+	r.endStartupHold()
+}
+
+func (r *vcdInstanceGroup) endStartupHold() {
+	r.startupHold = false
+	r.limiter.setCreateReserve(true)
 }
 
 func (r *vcdInstanceGroup) doCreate(intentID string) {

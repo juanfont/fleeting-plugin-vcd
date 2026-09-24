@@ -92,11 +92,13 @@ func newTestReconciler(t *testing.T) *vcdInstanceGroup {
 	t.Helper()
 	log := hclog.NewNullLogger()
 	store := newDesiredStateStore(log, "test-cb")
-	return newVCDInstanceGroup(log, store, nil, ReconcilerConfig{
+	r := newVCDInstanceGroup(log, store, nil, ReconcilerConfig{
 		MaxConcurrentCreates: 3,
 		MaxConcurrentDeletes: 5,
 		MaxInstanceAge:       24 * time.Hour,
 	})
+	r.endStartupHold()
+	return r
 }
 
 func TestCircuitBreaker_BlocksDispatchWhenActive(t *testing.T) {
