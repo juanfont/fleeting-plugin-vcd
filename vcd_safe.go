@@ -30,6 +30,18 @@ func isPermanentError(err error) bool {
 	return false
 }
 
+// notFoundIsPermanent stops safeVCDCall retrying a read of an entity that no
+// longer exists. Discovery re-lists every cycle, so a retry only delays it.
+func notFoundIsPermanent[T any](fn func() (T, error)) func() (T, error) {
+	return func() (T, error) {
+		v, err := fn()
+		if isEntityNotFoundError(err) {
+			return v, backoff.Permanent(err)
+		}
+		return v, err
+	}
+}
+
 const (
 	safeCallMaxElapsedTime  = 5 * time.Minute
 	safeCallInitialInterval = time.Second

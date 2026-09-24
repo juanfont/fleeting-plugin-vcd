@@ -28,13 +28,18 @@ var (
 )
 
 // isEntityNotFoundError returns true if the error indicates the VCD entity no longer exists.
+// vCD reports this as a 403 "... entity <id> does not exist." and the SDK as ErrorEntityNotFound.
 func isEntityNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, govcd.ErrorEntityNotFound) {
+		return true
+	}
 	msg := err.Error()
 	return strings.Contains(msg, "does not exist") ||
-		strings.Contains(msg, "could not be found")
+		strings.Contains(msg, "could not be found") ||
+		strings.Contains(msg, "[ENF]")
 }
 
 const (
@@ -546,9 +551,9 @@ func (g *InstanceGroup) getInstancesInInstanceGroup() (vApps []*govcd.VApp, err 
 
 	vApps = []*govcd.VApp{}
 	for _, result := range sr.results {
-		vApp, err := safeVCDCall(context.Background(), g, "GetVAppByHref(poll)", func() (*govcd.VApp, error) {
+		vApp, err := safeVCDCall(context.Background(), g, "GetVAppByHref(poll)", notFoundIsPermanent(func() (*govcd.VApp, error) {
 			return vdc.GetVAppByHref(result.GetHref())
-		})
+		}))
 		if err != nil {
 			g.log.Warn("error getting vApp, skipping",
 				"name", result.GetName(),
