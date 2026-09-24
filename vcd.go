@@ -51,6 +51,10 @@ const (
 	sshReadinessRetryInterval = 5 * time.Second
 	sshHandshakeTimeout       = 10 * time.Second
 
+	// pollReadTimeout bounds each vCD read made by the reconciler's poll so a
+	// slow or vanished entity cannot hold up dispatch.
+	pollReadTimeout = 30 * time.Second
+
 	vcdAPIVersion = "38.1"
 )
 
@@ -488,37 +492,39 @@ func (g *InstanceGroup) createInstance() (result *createResult, err error) {
 	}, nil
 }
 
-func (g *InstanceGroup) getInstancesInInstanceGroup() (vApps []*govcd.VApp, err error) {
+// getInstancesInInstanceGroup lists the group's vApps. Every vCD read is bounded
+// by pollReadTimeout. It returns an error when the group cannot be listed, so a
+// failed poll is never mistaken for an empty group.
+func (g *InstanceGroup) getInstancesInInstanceGroup(ctx context.Context) (vApps []*govcd.VApp, err error) {
 	// Recover from panics in VCD library (known issue with SearchByFilter).
-	// Return empty list instead of error to avoid killing the taskscaler.
 	defer func() {
 		if r := recover(); r != nil {
-			g.log.Error("Panic recovered in getInstancesInInstanceGroup (returning empty list)", "panic", r)
-			vApps = []*govcd.VApp{}
-			err = nil
+			vApps, err = nil, fmt.Errorf("panic listing instance group vApps: %v", r)
 		}
 	}()
+	read := func() (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, pollReadTimeout) }
 
 	client, err := g.getVCDClient()
 	if err != nil {
-		g.log.Error("error creating VCD client (returning empty list)", "error", err)
-		return []*govcd.VApp{}, nil
+		return nil, err
 	}
 
-	org, err := safeVCDCall(context.Background(), g, "GetOrgByName(poll)", func() (*govcd.Org, error) {
+	readCtx, cancel := read()
+	org, err := safeVCDCall(readCtx, g, "GetOrgByName(poll)", func() (*govcd.Org, error) {
 		return client.GetOrgByName(g.Org)
 	})
+	cancel()
 	if err != nil {
-		g.log.Error("error getting org (returning empty list)", "error", err)
-		return []*govcd.VApp{}, nil
+		return nil, err
 	}
 
-	vdc, err := safeVCDCall(context.Background(), g, "GetVDCByName(poll)", func() (*govcd.Vdc, error) {
+	readCtx, cancel = read()
+	vdc, err := safeVCDCall(readCtx, g, "GetVDCByName(poll)", func() (*govcd.Vdc, error) {
 		return org.GetVDCByName(g.VirtualDatacenter, true)
 	})
+	cancel()
 	if err != nil {
-		g.log.Error("error getting VDC (returning empty list)", "error", err)
-		return []*govcd.VApp{}, nil
+		return nil, err
 	}
 
 	criteria := &govcd.FilterDef{
@@ -540,20 +546,23 @@ func (g *InstanceGroup) getInstancesInInstanceGroup() (vApps []*govcd.VApp, err 
 		results     []govcd.QueryItem
 		explanation string
 	}
-	sr, err := safeVCDCall(context.Background(), g, "SearchByFilter", func() (searchResult, error) {
+	readCtx, cancel = read()
+	sr, err := safeVCDCall(readCtx, g, "SearchByFilter", func() (searchResult, error) {
 		results, explanation, err := client.Client.SearchByFilter(types.QtVapp, criteria)
 		return searchResult{results, explanation}, err
 	})
+	cancel()
 	if err != nil {
-		g.log.Error("error searching for vapps (returning empty list to avoid taskscaler death)", "error", err)
-		return []*govcd.VApp{}, nil
+		return nil, err
 	}
 
 	vApps = []*govcd.VApp{}
 	for _, result := range sr.results {
-		vApp, err := safeVCDCall(context.Background(), g, "GetVAppByHref(poll)", notFoundIsPermanent(func() (*govcd.VApp, error) {
+		readCtx, cancel = read()
+		vApp, err := safeVCDCall(readCtx, g, "GetVAppByHref(poll)", notFoundIsPermanent(func() (*govcd.VApp, error) {
 			return vdc.GetVAppByHref(result.GetHref())
 		}))
+		cancel()
 		if err != nil {
 			g.log.Warn("error getting vApp, skipping",
 				"name", result.GetName(),
@@ -568,12 +577,12 @@ func (g *InstanceGroup) getInstancesInInstanceGroup() (vApps []*govcd.VApp, err 
 }
 
 // pollVM reads the IP address and OS type of a VM for the reconciler's poll.
-func (g *InstanceGroup) pollVM(vmHREF string) (*vmPollResult, error) {
+func (g *InstanceGroup) pollVM(ctx context.Context, vmHREF string) (*vmPollResult, error) {
 	client, err := g.getVCDClient()
 	if err != nil {
 		return nil, err
 	}
-	return safeVCDCall(context.Background(), g, "refresh VM for poll", func() (*vmPollResult, error) {
+	return safeVCDCall(ctx, g, "refresh VM for poll", func() (*vmPollResult, error) {
 		vm := govcd.NewVM(&client.Client)
 		vm.VM.HREF = vmHREF
 		if err := vm.Refresh(); err != nil {

@@ -42,6 +42,7 @@ type ReconcilerConfig struct {
 	MaxConcurrentOperations int
 	Interval                time.Duration
 	MaxInstanceAge          time.Duration
+	PollReadTimeout         time.Duration
 }
 
 func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
@@ -61,14 +62,17 @@ func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
 	if out.MaxInstanceAge <= 0 {
 		out.MaxInstanceAge = defaultMaxInstanceAge
 	}
+	if out.PollReadTimeout <= 0 {
+		out.PollReadTimeout = pollReadTimeout
+	}
 	return out
 }
 
 // vcdOps is the vCD work the reconciler performs. *InstanceGroup implements it;
 // unit tests substitute a fake.
 type vcdOps interface {
-	getInstancesInInstanceGroup() ([]*govcd.VApp, error)
-	pollVM(vmHREF string) (*vmPollResult, error)
+	getInstancesInInstanceGroup(ctx context.Context) ([]*govcd.VApp, error)
+	pollVM(ctx context.Context, vmHREF string) (*vmPollResult, error)
 	createInstance() (*createResult, error)
 	deleteInstance(href string) error
 	cleanUpInstanceByName(name string) error
@@ -86,6 +90,10 @@ type vcdInstanceGroup struct {
 	ops      vcdOps
 	limiter  *opLimiter
 	throttle *throttleGate
+
+	// ctx ends when Shutdown starts; every vCD call the reconciler makes derives from it.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// backgroundDeletes tracks failed-create cleanups in flight to avoid
 	// starting duplicates on every cycle.
@@ -108,8 +116,11 @@ type vcdInstanceGroup struct {
 func newVCDInstanceGroup(log hclog.Logger, store *desiredStateStore, ig *InstanceGroup, config ReconcilerConfig) *vcdInstanceGroup {
 	config = config.withDefaults()
 	throttle := newThrottleGate(log, store.instanceGroupName)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	r := &vcdInstanceGroup{
+		ctx:       ctx,
+		cancel:    cancel,
 		log:       log,
 		store:     store,
 		config:    config,
@@ -221,7 +232,9 @@ func (r *vcdInstanceGroup) reconcileOnce(doGC bool) {
 	}()
 
 	// Step 1: Poll VCD and update cache
-	r.pollVCD()
+	if err := r.pollVCD(); err != nil {
+		r.log.Error("error polling VCD", "error", err)
+	}
 
 	// Step 2: Dispatch pending creates
 	r.dispatchCreates()
@@ -243,11 +256,10 @@ func (r *vcdInstanceGroup) reconcileOnce(doGC bool) {
 	PoolSize.WithLabelValues(r.store.instanceGroupName).Set(float64(r.store.Size()))
 }
 
-func (r *vcdInstanceGroup) pollVCD() {
-	vApps, err := r.ops.getInstancesInInstanceGroup()
+func (r *vcdInstanceGroup) pollVCD() error {
+	vApps, err := r.ops.getInstancesInInstanceGroup(r.ctx)
 	if err != nil {
-		r.log.Error("error polling VCD", "error", err)
-		return
+		return fmt.Errorf("listing instance group vApps: %w", err)
 	}
 
 	knownHREFs := make(map[string]bool)
@@ -280,22 +292,25 @@ func (r *vcdInstanceGroup) pollVCD() {
 
 		vm := vapp.VApp.Children.VM[0]
 		var ipAddress, osType string
-		if pollResult, err := r.ops.pollVM(vm.HREF); err == nil && pollResult != nil {
+		readCtx, cancel := context.WithTimeout(r.ctx, r.config.PollReadTimeout)
+		pollResult, err := r.ops.pollVM(readCtx, vm.HREF)
+		cancel()
+		if err == nil && pollResult != nil {
 			ipAddress = pollResult.IP
 			osType = pollResult.OSType
 		}
 		r.store.UpdateFromVCD(href, name, vm.Name, ipAddress, vappStatus, types.VAppStatuses[vm.Status], osType)
 	}
 
-	// Mark disappeared instances — but only if the poll actually returned results.
-	// If VCD is unreachable, getInstancesInInstanceGroup returns an empty list to
-	// keep fleeting alive. We must not treat that as "all instances disappeared"
-	// or fleeting will request a stampede of new creates when VCD comes back.
+	// A successful listing that returns nothing while we still track instances is
+	// more likely an eventual-consistency gap than a wiped group; wait for a
+	// listing that shows something before counting misses.
 	if len(knownHREFs) > 0 || r.store.Size() == 0 {
 		r.store.MarkDisappeared(knownHREFs)
 	} else {
 		r.log.Warn("skipping MarkDisappeared: poll returned 0 vApps but store has instances (VCD may be unreachable)")
 	}
+	return nil
 }
 
 type vmPollResult struct {

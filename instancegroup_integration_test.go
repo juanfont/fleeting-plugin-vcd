@@ -459,7 +459,7 @@ func TestInstanceGroup_ShutdownMidCreate(t *testing.T) {
 
 	// Verify no VMs left in VCD for this instance group
 	time.Sleep(30 * time.Second) // give VCD time to settle
-	vApps, err := rawIG.getInstancesInInstanceGroup()
+	vApps, err := rawIG.getInstancesInInstanceGroup(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, vApps, "expected no vApps left after shutdown, found %d", len(vApps))
 }

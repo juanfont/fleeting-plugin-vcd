@@ -25,11 +25,17 @@ type fakeOps struct {
 	create  func() (*createResult, error)
 	delete  func(href string) error
 	owned   map[string]bool
+
+	listErr      error
+	pollVMBlocks bool
 }
 
-func (f *fakeOps) getInstancesInInstanceGroup() ([]*govcd.VApp, error) {
+func (f *fakeOps) getInstancesInInstanceGroup(ctx context.Context) ([]*govcd.VApp, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return append([]*govcd.VApp(nil), f.vApps...), nil
 }
 
@@ -39,10 +45,15 @@ func (f *fakeOps) setVApps(vApps []*govcd.VApp) {
 	f.vApps = vApps
 }
 
-func (f *fakeOps) pollVM(vmHREF string) (*vmPollResult, error) {
+func (f *fakeOps) pollVM(ctx context.Context, vmHREF string) (*vmPollResult, error) {
 	f.mu.Lock()
 	f.polled = append(f.polled, vmHREF)
+	blocks := f.pollVMBlocks
 	f.mu.Unlock()
+	if blocks {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	return &vmPollResult{IP: "10.0.0.1", OSType: "debian12_64Guest"}, nil
 }
 
@@ -371,4 +382,42 @@ func TestShutdown_ReturnsWhenContextEndsDuringDelete(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Shutdown did not return after its context ended")
 	}
+}
+
+// trackRunning stores a Running instance for testVApp(i, ...).
+func trackRunning(r *vcdInstanceGroup, i int) {
+	intent := fmt.Sprintf("intent-%d", i)
+	r.store.AddCreateIntent(intent)
+	r.store.UpdateInstance(intent, func(inst *Instance) {
+		inst.Phase = PhaseRunning
+		inst.ID = fmt.Sprintf("https://vcd/vapp-%d", i)
+		inst.Name = fmt.Sprintf("runner-%d", i)
+	})
+}
+
+func TestPoll_SlowVMReadDoesNotBlockDispatch(t *testing.T) {
+	ops := &fakeOps{pollVMBlocks: true}
+	r := newFakeReconciler(t, ops, ReconcilerConfig{PollReadTimeout: 20 * time.Millisecond})
+	for i := 1; i <= 3; i++ {
+		trackRunning(r, i)
+	}
+	ops.setVApps([]*govcd.VApp{testVApp(1, false), testVApp(2, false), testVApp(3, false)})
+
+	start := time.Now()
+	require.NoError(t, r.pollVCD())
+	assert.Less(t, time.Since(start), time.Second)
+	assert.Equal(t, 3, ops.polledCount())
+}
+
+func TestPoll_ListFailureIsReportedAndKeepsState(t *testing.T) {
+	ops := &fakeOps{listErr: errors.New("search failed")}
+	r := newFakeReconciler(t, ops, ReconcilerConfig{})
+	trackRunning(r, 1)
+
+	for i := 0; i < missedPollsBeforeDisappeared+1; i++ {
+		require.Error(t, r.pollVCD())
+	}
+	inst, _ := r.store.GetByVAppHREF("https://vcd/vapp-1")
+	assert.Equal(t, PhaseRunning, inst.Phase)
+	assert.Zero(t, inst.MissedPolls)
 }
