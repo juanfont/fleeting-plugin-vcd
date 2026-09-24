@@ -152,8 +152,8 @@ func TestFailedCreateCleanup_RetainedUntilDeleted(t *testing.T) {
 	defer cancel()
 	waitForCleanup := func() {
 		t.Helper()
-		require.NoError(t, r.deleteSem.Acquire(ctx, int64(r.config.MaxConcurrentDeletes)))
-		r.deleteSem.Release(int64(r.config.MaxConcurrentDeletes))
+		require.NoError(t, r.limiter.total.Acquire(ctx, r.limiter.size))
+		r.limiter.total.Release(r.limiter.size)
 	}
 	r.dispatchCreateCleanups()
 	waitForCleanup()

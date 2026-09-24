@@ -119,4 +119,9 @@ var (
 		Name: "fleeting_vcd_reconcile_total",
 		Help: "Total number of reconciliation cycles",
 	}, []string{instanceGroupLabel})
+
+	LastReconcileTimestamp = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "fleeting_vcd_last_reconcile_timestamp_seconds",
+		Help: "Unix time the last reconciliation cycle finished; alert when it stops advancing",
+	}, []string{instanceGroupLabel})
 )

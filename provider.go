@@ -42,25 +42,26 @@ type InstanceGroup struct {
 	throttle *throttleGate
 
 	// Cloud Director connection config
-	StrURL                 string `json:"url"`
-	Org                    string `json:"org"`
-	Token                  string `json:"token"`
-	VirtualDatacenter      string `json:"virtual_datacenter"`
-	Network                string `json:"network"`
-	IPAllocationMode       string `json:"ip_allocation_mode"`
-	InstanceGroupName      string `json:"instance_group_name"`
-	VAppNamePrefix         string `json:"vapp_name_prefix"`
-	Catalog                string `json:"catalog"`
-	Template               string `json:"template"`
-	StorageProfile         string `json:"storage_profile"`
-	CPUCount               int    `json:"cpu_count"`
-	CoresPerSocket         int    `json:"cores_per_socket"`
-	MemoryMB               int64  `json:"memory_mb"`
-	DiskSizeGB             int    `json:"disk_size_gb"`
-	DebugServerAddr        string `json:"debug_server_addr"`
-	MaxConcurrentCreates   int    `json:"max_concurrent_creates"`
-	MaxConcurrentDeletes   int    `json:"max_concurrent_deletes"`
-	SessionRefreshInterval string `json:"session_refresh_interval"`
+	StrURL                  string `json:"url"`
+	Org                     string `json:"org"`
+	Token                   string `json:"token"`
+	VirtualDatacenter       string `json:"virtual_datacenter"`
+	Network                 string `json:"network"`
+	IPAllocationMode        string `json:"ip_allocation_mode"`
+	InstanceGroupName       string `json:"instance_group_name"`
+	VAppNamePrefix          string `json:"vapp_name_prefix"`
+	Catalog                 string `json:"catalog"`
+	Template                string `json:"template"`
+	StorageProfile          string `json:"storage_profile"`
+	CPUCount                int    `json:"cpu_count"`
+	CoresPerSocket          int    `json:"cores_per_socket"`
+	MemoryMB                int64  `json:"memory_mb"`
+	DiskSizeGB              int    `json:"disk_size_gb"`
+	DebugServerAddr         string `json:"debug_server_addr"`
+	MaxConcurrentCreates    int    `json:"max_concurrent_creates"`
+	MaxConcurrentDeletes    int    `json:"max_concurrent_deletes"`
+	MaxConcurrentOperations int    `json:"max_concurrent_operations"`
+	SessionRefreshInterval  string `json:"session_refresh_interval"`
 
 	parsedURL *url.URL
 
@@ -95,8 +96,9 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 
 	// Create and start reconciler
 	config := ReconcilerConfig{
-		MaxConcurrentCreates: g.MaxConcurrentCreates,
-		MaxConcurrentDeletes: g.MaxConcurrentDeletes,
+		MaxConcurrentCreates:    g.MaxConcurrentCreates,
+		MaxConcurrentDeletes:    g.MaxConcurrentDeletes,
+		MaxConcurrentOperations: g.MaxConcurrentOperations,
 	}
 	reconciler := newVCDInstanceGroup(g.log, g.store, g, config)
 	reconciler.Start()

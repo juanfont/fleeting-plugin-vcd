@@ -125,6 +125,9 @@ func (g *InstanceGroup) populate() error {
 	if g.MaxConcurrentDeletes <= 0 {
 		g.MaxConcurrentDeletes = defaultMaxConcurrentDeletes
 	}
+	if g.MaxConcurrentOperations <= 0 {
+		g.MaxConcurrentOperations = defaultMaxConcurrentOperations
+	}
 
 	return nil
 }

@@ -12,15 +12,15 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/vmware/go-vcloud-director/v3/govcd"
 	"github.com/vmware/go-vcloud-director/v3/types/v56"
-	"golang.org/x/sync/semaphore"
 )
 
 const (
-	defaultReconcileInterval    = 10 * time.Second
-	defaultMaxConcurrentCreates = 3
-	defaultMaxConcurrentDeletes = 5
-	defaultMaxInstanceAge       = 24 * time.Hour
-	gcCheckEveryN               = 360 // ~1h at 10s interval
+	defaultReconcileInterval       = 10 * time.Second
+	defaultMaxConcurrentCreates    = 3
+	defaultMaxConcurrentDeletes    = 5
+	defaultMaxConcurrentOperations = 4
+	defaultMaxInstanceAge          = 24 * time.Hour
+	gcCheckEveryN                  = 360 // ~1h at 10s interval
 
 	// Retry backoff for per-intent retries
 	retryBaseDelay  = 10 * time.Second
@@ -37,10 +37,11 @@ const (
 
 // ReconcilerConfig holds configuration for the reconciliation loop.
 type ReconcilerConfig struct {
-	MaxConcurrentCreates int
-	MaxConcurrentDeletes int
-	Interval             time.Duration
-	MaxInstanceAge       time.Duration
+	MaxConcurrentCreates    int
+	MaxConcurrentDeletes    int
+	MaxConcurrentOperations int
+	Interval                time.Duration
+	MaxInstanceAge          time.Duration
 }
 
 func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
@@ -51,6 +52,9 @@ func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
 	if out.MaxConcurrentDeletes <= 0 {
 		out.MaxConcurrentDeletes = defaultMaxConcurrentDeletes
 	}
+	if out.MaxConcurrentOperations <= 0 {
+		out.MaxConcurrentOperations = defaultMaxConcurrentOperations
+	}
 	if out.Interval <= 0 {
 		out.Interval = defaultReconcileInterval
 	}
@@ -60,6 +64,16 @@ func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
 	return out
 }
 
+// vcdOps is the vCD work the reconciler performs. *InstanceGroup implements it;
+// unit tests substitute a fake.
+type vcdOps interface {
+	getInstancesInInstanceGroup() ([]*govcd.VApp, error)
+	pollVM(vmHREF string) (*vmPollResult, error)
+	createInstance() (*createResult, error)
+	deleteInstance(href string) error
+	cleanUpInstanceByName(name string) error
+}
+
 // vcdInstanceGroup implements VCDInstanceGroup using a reconciliation loop.
 type vcdInstanceGroup struct {
 	log    hclog.Logger
@@ -67,8 +81,9 @@ type vcdInstanceGroup struct {
 	config ReconcilerConfig
 	ig     *InstanceGroup // reference to the provider for VCD operations
 
-	createSem *semaphore.Weighted
-	deleteSem *semaphore.Weighted
+	ops      vcdOps
+	limiter  *opLimiter
+	throttle *throttleGate
 
 	// backgroundDeletes tracks HREFs with in-flight background delete goroutines
 	// (orphan/preexisting cleanup) to avoid firing duplicates on every poll.
@@ -90,19 +105,26 @@ type vcdInstanceGroup struct {
 
 func newVCDInstanceGroup(log hclog.Logger, store *desiredStateStore, ig *InstanceGroup, config ReconcilerConfig) *vcdInstanceGroup {
 	config = config.withDefaults()
+	throttle := newThrottleGate(log, store.instanceGroupName)
 
-	return &vcdInstanceGroup{
+	r := &vcdInstanceGroup{
 		log:       log,
 		store:     store,
 		config:    config,
 		ig:        ig,
-		createSem: semaphore.NewWeighted(int64(config.MaxConcurrentCreates)),
-		deleteSem: semaphore.NewWeighted(int64(config.MaxConcurrentDeletes)),
+		limiter:   newOpLimiter(config.MaxConcurrentOperations, config.MaxConcurrentCreates, config.MaxConcurrentDeletes, throttle),
+		throttle:  throttle,
 		cbBackoff: newCircuitBreakerBackOff(),
 		triggerCh: make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
 	}
+	if ig != nil {
+		// vCD calls report throttling to the same gate that pauses dispatch.
+		ig.throttle = throttle
+		r.ops = ig
+	}
+	return r
 }
 
 func newCircuitBreakerBackOff() *backoff.ExponentialBackOff {
@@ -186,6 +208,7 @@ func (r *vcdInstanceGroup) reconcileOnce(doGC bool) {
 		duration := time.Since(startTime).Seconds()
 		ReconcileDuration.WithLabelValues(r.store.instanceGroupName).Observe(duration)
 		ReconcileTotal.WithLabelValues(r.store.instanceGroupName).Inc()
+		LastReconcileTimestamp.WithLabelValues(r.store.instanceGroupName).SetToCurrentTime()
 	}()
 
 	// Recover from panics in the reconcile loop itself
@@ -219,18 +242,13 @@ func (r *vcdInstanceGroup) reconcileOnce(doGC bool) {
 }
 
 func (r *vcdInstanceGroup) pollVCD() {
-	vApps, err := r.ig.getInstancesInInstanceGroup()
+	vApps, err := r.ops.getInstancesInInstanceGroup()
 	if err != nil {
 		r.log.Error("error polling VCD", "error", err)
 		return
 	}
 
 	knownHREFs := make(map[string]bool)
-	client, err := r.ig.getVCDClient()
-	if err != nil {
-		r.log.Error("error getting VCD client for poll", "error", err)
-		return
-	}
 
 	for _, vapp := range vApps {
 		href := vapp.VApp.HREF
@@ -245,22 +263,7 @@ func (r *vcdInstanceGroup) pollVCD() {
 
 			// Try to get IP address and OS type from the VM
 			vmHREF := vapp.VApp.Children.VM[0].HREF
-			pollResult, err := safeVCDCall(context.Background(), r.ig, "refresh VM for poll", func() (*vmPollResult, error) {
-				vm := govcd.NewVM(&client.Client)
-				vm.VM.HREF = vmHREF
-				if err := vm.Refresh(); err != nil {
-					if isEntityNotFoundError(err) {
-						return nil, backoff.Permanent(err)
-					}
-					return nil, err
-				}
-				ip, _ := getPrimaryIPAddress(vm)
-				var osType string
-				if vm.VM.VmSpecSection != nil {
-					osType = vm.VM.VmSpecSection.OsType
-				}
-				return &vmPollResult{IP: ip, OSType: osType}, nil
-			})
+			pollResult, err := r.ops.pollVM(vmHREF)
 
 			var ipAddress, osType string
 			if err == nil && pollResult != nil {
@@ -318,7 +321,7 @@ func (r *vcdInstanceGroup) backgroundDelete(href, reason string) {
 			}
 		}()
 
-		if err := r.ig.deleteInstance(href); err != nil {
+		if err := r.ops.deleteInstance(href); err != nil {
 			r.log.Error("background delete failed", "href", href, "error", err)
 		}
 	}()
@@ -341,8 +344,8 @@ func (r *vcdInstanceGroup) dispatchCreates() {
 	pending := r.store.GetPendingCreates()
 	for _, inst := range pending {
 		intentID := inst.IntentID
-		if !r.createSem.TryAcquire(1) {
-			break // max concurrent creates reached
+		if !r.limiter.tryAcquire(opCreate) {
+			break // operation limit reached or throttled
 		}
 
 		// Mark as creating
@@ -353,7 +356,7 @@ func (r *vcdInstanceGroup) dispatchCreates() {
 		})
 
 		go func() {
-			defer r.createSem.Release(1)
+			defer r.limiter.release(opCreate)
 			r.doCreate(intentID)
 		}()
 	}
@@ -362,7 +365,7 @@ func (r *vcdInstanceGroup) dispatchCreates() {
 func (r *vcdInstanceGroup) doCreate(intentID string) {
 	startTime := time.Now()
 
-	result, err := r.ig.createInstance()
+	result, err := r.ops.createInstance()
 	duration := time.Since(startTime).Seconds()
 	InstanceCreationDuration.WithLabelValues(r.store.instanceGroupName).Observe(duration)
 
@@ -386,6 +389,7 @@ func (r *vcdInstanceGroup) doCreate(intentID string) {
 	}
 
 	r.recordCreateSuccess()
+	r.throttle.succeeded()
 
 	InstancesCreatedTotal.WithLabelValues(r.store.instanceGroupName).Inc()
 
@@ -426,8 +430,8 @@ func (r *vcdInstanceGroup) dispatchDeletes() {
 			continue
 		}
 
-		if !r.deleteSem.TryAcquire(1) {
-			break // max concurrent deletes reached
+		if !r.limiter.tryAcquire(opDelete) {
+			break // operation limit reached or throttled
 		}
 
 		// Mark as deleting
@@ -438,7 +442,7 @@ func (r *vcdInstanceGroup) dispatchDeletes() {
 		})
 
 		go func() {
-			defer r.deleteSem.Release(1)
+			defer r.limiter.release(opDelete)
 			r.doDelete(intentID, href)
 		}()
 	}
@@ -447,6 +451,9 @@ func (r *vcdInstanceGroup) dispatchDeletes() {
 // Failed creates may not have received metadata yet, so discovery cannot be
 // relied on for cleanup. Retain their names until deletion is confirmed.
 func (r *vcdInstanceGroup) dispatchCreateCleanups() {
+	if r.ig == nil {
+		return
+	}
 	r.ig.failedCreateCleanups.Range(func(key, value any) bool {
 		name := key.(string)
 		requestedAt := value.(time.Time)
@@ -454,19 +461,22 @@ func (r *vcdInstanceGroup) dispatchCreateCleanups() {
 		if _, loaded := r.backgroundDeletes.LoadOrStore(cleanupKey, true); loaded {
 			return true
 		}
-		if !r.deleteSem.TryAcquire(1) {
+		if !r.limiter.tryAcquire(opDelete) {
 			r.backgroundDeletes.Delete(cleanupKey)
 			return false
 		}
 		go func() {
-			defer r.deleteSem.Release(1)
+			defer r.limiter.release(opDelete)
 			defer r.backgroundDeletes.Delete(cleanupKey)
 			defer func() {
 				if rec := recover(); rec != nil {
 					r.log.Error("panic cleaning up failed create", "name", name, "panic", rec)
 				}
 			}()
-			err := r.ig.cleanUpInstanceByName(name)
+			err := r.ops.cleanUpInstanceByName(name)
+			if err == nil {
+				r.throttle.succeeded()
+			}
 			// Allow time for a POST whose response was lost to become visible.
 			if err == nil || (errors.Is(err, govcd.ErrorEntityNotFound) && time.Since(requestedAt) >= safeCallMaxElapsedTime) {
 				r.ig.failedCreateCleanups.Delete(name)
@@ -481,7 +491,7 @@ func (r *vcdInstanceGroup) dispatchCreateCleanups() {
 func (r *vcdInstanceGroup) doDelete(intentID, href string) {
 	startTime := time.Now()
 
-	err := r.ig.deleteInstance(href)
+	err := r.ops.deleteInstance(href)
 	duration := time.Since(startTime).Seconds()
 	InstanceDeletionDuration.WithLabelValues(r.store.instanceGroupName).Observe(duration)
 
@@ -503,6 +513,7 @@ func (r *vcdInstanceGroup) doDelete(intentID, href string) {
 	}
 
 	InstancesDeletedTotal.WithLabelValues(r.store.instanceGroupName).Inc()
+	r.throttle.succeeded()
 
 	// Success
 	r.store.UpdateInstance(intentID, func(inst *Instance) {
@@ -588,18 +599,14 @@ func (r *vcdInstanceGroup) Shutdown(ctx context.Context) error {
 
 		// Wait for all in-flight creates and deletes to finish
 		r.log.Info("waiting for in-flight operations to complete")
-		if err := r.createSem.Acquire(ctx, int64(r.config.MaxConcurrentCreates)); err != nil {
-			r.shutdownErr = fmt.Errorf("waiting for creates: %w", err)
-			return
-		}
-		if err := r.deleteSem.Acquire(ctx, int64(r.config.MaxConcurrentDeletes)); err != nil {
-			r.shutdownErr = fmt.Errorf("waiting for deletes: %w", err)
+		if err := r.limiter.drain(ctx); err != nil {
+			r.shutdownErr = fmt.Errorf("waiting for in-flight operations: %w", err)
 			return
 		}
 
 		// Delete all remaining instances
 		r.ig.failedCreateCleanups.Range(func(key, value any) bool {
-			if err := r.ig.cleanUpInstanceByName(key.(string)); err != nil && !errors.Is(err, govcd.ErrorEntityNotFound) {
+			if err := r.ops.cleanUpInstanceByName(key.(string)); err != nil && !errors.Is(err, govcd.ErrorEntityNotFound) {
 				r.shutdownErr = errors.Join(r.shutdownErr, fmt.Errorf("cleanup failed create %s: %w", key, err))
 			}
 			return true
@@ -616,7 +623,7 @@ func (r *vcdInstanceGroup) Shutdown(ctx context.Context) error {
 				continue
 			}
 			r.log.Info("shutdown: deleting instance", "href", inst.ID, "name", inst.Name)
-			if err := r.ig.deleteInstance(inst.ID); err != nil {
+			if err := r.ops.deleteInstance(inst.ID); err != nil {
 				r.log.Error("error deleting instance during shutdown",
 					"href", inst.ID, "name", inst.Name, "error", err)
 			}

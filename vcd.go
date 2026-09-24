@@ -557,6 +557,30 @@ func (g *InstanceGroup) getInstancesInInstanceGroup() (vApps []*govcd.VApp, err 
 	return vApps, nil
 }
 
+// pollVM reads the IP address and OS type of a VM for the reconciler's poll.
+func (g *InstanceGroup) pollVM(vmHREF string) (*vmPollResult, error) {
+	client, err := g.getVCDClient()
+	if err != nil {
+		return nil, err
+	}
+	return safeVCDCall(context.Background(), g, "refresh VM for poll", func() (*vmPollResult, error) {
+		vm := govcd.NewVM(&client.Client)
+		vm.VM.HREF = vmHREF
+		if err := vm.Refresh(); err != nil {
+			if isEntityNotFoundError(err) {
+				return nil, backoff.Permanent(err)
+			}
+			return nil, err
+		}
+		ip, _ := getPrimaryIPAddress(vm)
+		var osType string
+		if vm.VM.VmSpecSection != nil {
+			osType = vm.VM.VmSpecSection.OsType
+		}
+		return &vmPollResult{IP: ip, OSType: osType}, nil
+	})
+}
+
 func (g *InstanceGroup) cleanUpInstanceByName(name string) error {
 	client, err := g.getVCDClient()
 	if err != nil {
