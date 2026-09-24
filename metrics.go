@@ -70,6 +70,16 @@ var (
 		Help: "Total number of VCD API errors",
 	}, []string{instanceGroupLabel, "operation"})
 
+	ThrottleEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fleeting_vcd_throttle_events_total",
+		Help: "Total number of requests rejected by the vCD organization operation limit",
+	}, []string{instanceGroupLabel})
+
+	ThrottlePauseSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "fleeting_vcd_throttle_pause_seconds",
+		Help: "Length of the most recent pause caused by the vCD organization operation limit",
+	}, []string{instanceGroupLabel})
+
 	APIDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "fleeting_vcd_api_duration_seconds",
 		Help:    "Time taken for VCD API calls",
