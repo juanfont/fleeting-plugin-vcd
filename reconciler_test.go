@@ -28,15 +28,22 @@ type fakeOps struct {
 
 	listErr      error
 	pollVMBlocks bool
+	unread       []string
 }
 
-func (f *fakeOps) getInstancesInInstanceGroup(ctx context.Context) ([]*govcd.VApp, error) {
+func (f *fakeOps) getInstancesInInstanceGroup(ctx context.Context) ([]*govcd.VApp, []string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
-		return nil, f.listErr
+		return nil, nil, f.listErr
 	}
-	return append([]*govcd.VApp(nil), f.vApps...), nil
+	return append([]*govcd.VApp(nil), f.vApps...), append([]string(nil), f.unread...), nil
+}
+
+func (f *fakeOps) setListErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listErr = err
 }
 
 func (f *fakeOps) setVApps(vApps []*govcd.VApp) {
@@ -407,7 +414,7 @@ func TestPoll_SlowVMReadDoesNotBlockDispatch(t *testing.T) {
 	start := time.Now()
 	require.NoError(t, r.pollVCD())
 	assert.Less(t, time.Since(start), time.Second)
-	assert.Equal(t, 3, ops.polledCount())
+	assert.Equal(t, 1, ops.polledCount(), "VM reads stop for this cycle after the first read fails")
 }
 
 func TestPoll_ListFailureIsReportedAndKeepsState(t *testing.T) {
@@ -515,7 +522,7 @@ func TestStartup_HoldsCreatesUntilLeftoversDeleted(t *testing.T) {
 	require.Eventually(t, func() bool { return creates.Load() == 1 }, time.Second, 5*time.Millisecond)
 }
 
-func TestStartup_DeletesUseEverySlotDuringHold(t *testing.T) {
+func TestStartup_KeepsCreateSlotDuringHold(t *testing.T) {
 	b := newBlocker()
 	ops := &fakeOps{delete: func(string) error { b.enter(); return nil }}
 	var vApps []*govcd.VApp
@@ -526,7 +533,10 @@ func TestStartup_DeletesUseEverySlotDuringHold(t *testing.T) {
 	r := newHeldReconciler(t, ops, ReconcilerConfig{MaxConcurrentOperations: 4})
 
 	r.reconcileOnce(false)
-	require.Eventually(t, func() bool { return b.inFlight.Load() == 4 }, time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return b.inFlight.Load() == 3 }, time.Second, 5*time.Millisecond)
+	r.reconcileOnce(false)
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, int32(3), b.peak.Load(), "stuck leftover deletes must not take the slot creates need once the hold ends")
 	close(b.release)
 }
 
@@ -587,4 +597,61 @@ func TestConfig_StartupCleanupTimeout(t *testing.T) {
 	for _, bad := range []string{"0s", "-1m", "later"} {
 		require.Error(t, (&InstanceGroup{StartupCleanupTimeout: bad}).populate(), bad)
 	}
+}
+
+func TestPoll_UnreadVAppIsNotMarkedMissing(t *testing.T) {
+	ops := &fakeOps{unread: []string{"https://vcd/vapp-1"}}
+	ops.setVApps([]*govcd.VApp{testVApp(2, false)})
+	r := newFakeReconciler(t, ops, ReconcilerConfig{})
+	trackRunning(r, 1)
+	trackRunning(r, 2)
+
+	for i := 0; i < missedPollsBeforeDisappeared+1; i++ {
+		require.ErrorIs(t, r.pollVCD(), errIncompletePoll)
+	}
+	inst, _ := r.store.GetByVAppHREF("https://vcd/vapp-1")
+	assert.Equal(t, PhaseRunning, inst.Phase, "a vApp vCD listed but we could not read is not gone")
+	assert.Zero(t, inst.MissedPolls)
+}
+
+func TestPoll_FailedVMReadKeepsLastIP(t *testing.T) {
+	ops := &fakeOps{pollVMBlocks: true}
+	r := newFakeReconciler(t, ops, ReconcilerConfig{PollReadTimeout: 20 * time.Millisecond})
+	trackRunning(r, 1)
+	r.store.UpdateInstance("intent-1", func(inst *Instance) { inst.IPAddress = "10.0.0.9" })
+	ops.setVApps([]*govcd.VApp{testVApp(1, false)})
+
+	require.NoError(t, r.pollVCD())
+	inst, _ := r.store.GetByIntentID("intent-1")
+	assert.Equal(t, "10.0.0.9", inst.IPAddress)
+}
+
+func TestStartup_IncompleteFirstPollKeepsHold(t *testing.T) {
+	var creates atomic.Int32
+	ops := &fakeOps{create: countingCreate(&creates), unread: []string{"https://vcd/vapp-1"}}
+	r := newHeldReconciler(t, ops, ReconcilerConfig{})
+	r.store.AddCreateIntent("new")
+
+	r.reconcileOnce(false)
+	time.Sleep(20 * time.Millisecond)
+	assert.Zero(t, creates.Load(), "an unread vApp may be a leftover")
+	assert.True(t, r.startupHold)
+}
+
+func TestStartup_TimeoutWaitsForFirstSuccessfulPoll(t *testing.T) {
+	var creates atomic.Int32
+	ops := &fakeOps{listErr: errors.New("vCD unreachable"), create: countingCreate(&creates), delete: func(string) error { select {} }}
+	r := newHeldReconciler(t, ops, ReconcilerConfig{StartupCleanupTimeout: time.Hour})
+	r.store.AddCreateIntent("new")
+	r.startedAt = time.Now().Add(-2 * time.Hour) // unreachable for longer than the timeout
+
+	r.reconcileOnce(false)
+	assert.True(t, r.startupHold)
+
+	ops.setListErr(nil)
+	ops.setVApps([]*govcd.VApp{testVApp(1, false)})
+	r.reconcileOnce(false)
+	time.Sleep(20 * time.Millisecond)
+	assert.Zero(t, creates.Load(), "the first successful poll found leftovers; they are deleted before creating")
+	assert.True(t, r.startupHold)
 }

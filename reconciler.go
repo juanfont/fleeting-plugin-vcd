@@ -81,7 +81,7 @@ func (c *ReconcilerConfig) withDefaults() ReconcilerConfig {
 // vcdOps is the vCD work the reconciler performs. *InstanceGroup implements it;
 // unit tests substitute a fake.
 type vcdOps interface {
-	getInstancesInInstanceGroup(ctx context.Context) ([]*govcd.VApp, error)
+	getInstancesInInstanceGroup(ctx context.Context) ([]*govcd.VApp, []string, error)
 	pollVM(ctx context.Context, vmHREF string) (*vmPollResult, error)
 	createInstance(ctx context.Context) (*createResult, error)
 	deleteInstance(href string) error
@@ -152,8 +152,6 @@ func newVCDInstanceGroup(log hclog.Logger, store *desiredStateStore, ig *Instanc
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
 	}
-	// Teardown may use every slot while creates are held.
-	r.limiter.setCreateReserve(false)
 	if ig != nil {
 		// vCD calls report throttling to the same gate that pauses dispatch.
 		ig.throttle = throttle
@@ -281,12 +279,18 @@ func (r *vcdInstanceGroup) reconcileOnce(doGC bool) {
 }
 
 func (r *vcdInstanceGroup) pollVCD() error {
-	vApps, err := r.ops.getInstancesInInstanceGroup(r.ctx)
+	vApps, unread, err := r.ops.getInstancesInInstanceGroup(r.ctx)
 	if err != nil {
 		return fmt.Errorf("listing instance group vApps: %w", err)
 	}
 
 	knownHREFs := make(map[string]bool)
+	// vCD listed these but we could not read them: they exist, so they must
+	// never count as missing. They are read again on the next poll.
+	for _, href := range unread {
+		knownHREFs[href] = true
+	}
+	skipVMReads := false
 
 	for _, vapp := range vApps {
 		href := vapp.VApp.HREF
@@ -315,15 +319,22 @@ func (r *vcdInstanceGroup) pollVCD() error {
 		}
 
 		vm := vapp.VApp.Children.VM[0]
-		var ipAddress, osType string
+		if skipVMReads {
+			continue // keep the last observed state until the next poll
+		}
 		readCtx, cancel := context.WithTimeout(r.ctx, r.config.PollReadTimeout)
 		pollResult, err := r.ops.pollVM(readCtx, vm.HREF)
 		cancel()
-		if err == nil && pollResult != nil {
-			ipAddress = pollResult.IP
-			osType = pollResult.OSType
+		if err != nil || pollResult == nil {
+			// Keep the last observed IP. After a failure other than "gone",
+			// skip the remaining VM reads so a slow vCD costs one read
+			// deadline per poll, not one per instance.
+			if !isEntityNotFoundError(err) {
+				skipVMReads = true
+			}
+			continue
 		}
-		r.store.UpdateFromVCD(href, name, vm.Name, ipAddress, vappStatus, types.VAppStatuses[vm.Status], osType)
+		r.store.UpdateFromVCD(href, name, vm.Name, pollResult.IP, vappStatus, types.VAppStatuses[vm.Status], pollResult.OSType)
 	}
 
 	// A successful listing that returns nothing while we still track instances is
@@ -334,8 +345,14 @@ func (r *vcdInstanceGroup) pollVCD() error {
 	} else {
 		r.log.Warn("skipping MarkDisappeared: poll returned 0 vApps but store has instances (VCD may be unreachable)")
 	}
+	if len(unread) > 0 {
+		return fmt.Errorf("%w: %d listed vApps could not be read", errIncompletePoll, len(unread))
+	}
 	return nil
 }
+
+// errIncompletePoll reports a listing whose vApps could not all be read.
+var errIncompletePoll = errors.New("incomplete poll")
 
 type vmPollResult struct {
 	IP     string
@@ -392,12 +409,18 @@ func (r *vcdInstanceGroup) updateStartupHold(pollOK bool) {
 	if !r.startupHold {
 		return
 	}
-	if pollOK {
+	if pollOK && !r.startupPolled {
+		// The cleanup timeout counts from the first complete view of the
+		// group: while vCD cannot be listed, creates would fail anyway.
 		r.startupPolled = true
+		r.startedAt = time.Now()
+	}
+	if !r.startupPolled {
+		return
 	}
 	remaining := r.store.LeftoverCount()
 	switch {
-	case r.startupPolled && remaining == 0:
+	case remaining == 0:
 		r.log.Info("startup cleanup complete, creating instances")
 	case time.Since(r.startedAt) >= r.config.StartupCleanupTimeout:
 		r.log.Warn("startup cleanup timed out, creating instances anyway",
@@ -410,7 +433,6 @@ func (r *vcdInstanceGroup) updateStartupHold(pollOK bool) {
 
 func (r *vcdInstanceGroup) endStartupHold() {
 	r.startupHold = false
-	r.limiter.setCreateReserve(true)
 }
 
 func (r *vcdInstanceGroup) doCreate(intentID string) {

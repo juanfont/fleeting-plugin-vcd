@@ -492,18 +492,18 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (result *createResul
 // getInstancesInInstanceGroup lists the group's vApps. Every vCD read is bounded
 // by pollReadTimeout. It returns an error when the group cannot be listed, so a
 // failed poll is never mistaken for an empty group.
-func (g *InstanceGroup) getInstancesInInstanceGroup(ctx context.Context) (vApps []*govcd.VApp, err error) {
+func (g *InstanceGroup) getInstancesInInstanceGroup(ctx context.Context) (vApps []*govcd.VApp, unread []string, err error) {
 	// Recover from panics in VCD library (known issue with SearchByFilter).
 	defer func() {
 		if r := recover(); r != nil {
-			vApps, err = nil, fmt.Errorf("panic listing instance group vApps: %v", r)
+			vApps, unread, err = nil, nil, fmt.Errorf("panic listing instance group vApps: %v", r)
 		}
 	}()
 	read := func() (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, pollReadTimeout) }
 
 	client, err := g.getVCDClient()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	readCtx, cancel := read()
@@ -512,7 +512,7 @@ func (g *InstanceGroup) getInstancesInInstanceGroup(ctx context.Context) (vApps 
 	})
 	cancel()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	readCtx, cancel = read()
@@ -521,7 +521,7 @@ func (g *InstanceGroup) getInstancesInInstanceGroup(ctx context.Context) (vApps 
 	})
 	cancel()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	criteria := &govcd.FilterDef{
@@ -550,27 +550,50 @@ func (g *InstanceGroup) getInstancesInInstanceGroup(ctx context.Context) (vApps 
 	})
 	cancel()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	vApps = []*govcd.VApp{}
+	listed := make([]listedVApp, 0, len(sr.results))
 	for _, result := range sr.results {
-		readCtx, cancel = read()
-		vApp, err := safeVCDCall(readCtx, g, "GetVAppByHref(poll)", notFoundIsPermanent(func() (*govcd.VApp, error) {
-			return vdc.GetVAppByHref(result.GetHref())
+		listed = append(listed, listedVApp{href: result.GetHref(), name: result.GetName()})
+	}
+	vApps, unread = g.readListedVApps(listed, func(href string) (*govcd.VApp, error) {
+		readCtx, cancel := read()
+		defer cancel()
+		return safeVCDCall(readCtx, g, "GetVAppByHref(poll)", notFoundIsPermanent(func() (*govcd.VApp, error) {
+			return vdc.GetVAppByHref(href)
 		}))
-		cancel()
-		if err != nil {
-			g.log.Warn("error getting vApp, skipping",
-				"name", result.GetName(),
-				"href", result.GetHref(), "error", err)
+	})
+	return vApps, unread, nil
+}
+
+// listedVApp is a vApp returned by the group search, before it is read.
+type listedVApp struct{ href, name string }
+
+// readListedVApps reads each listed vApp. A vApp that no longer exists is
+// dropped. The first other failure (typically the read deadline) stops the
+// reads: that vApp and every one after it are returned as unread, so a slow
+// vCD costs one read deadline per poll, not one per vApp, and callers can tell
+// a vApp we failed to read from one that is gone.
+func (g *InstanceGroup) readListedVApps(listed []listedVApp, read func(href string) (*govcd.VApp, error)) (vApps []*govcd.VApp, unread []string) {
+	for i, item := range listed {
+		vApp, err := read(item.href)
+		if err == nil {
+			vApps = append(vApps, vApp)
 			continue
 		}
-
-		vApps = append(vApps, vApp)
+		if isEntityNotFoundError(err) {
+			g.log.Debug("listed vApp no longer exists", "name", item.name, "href", item.href)
+			continue
+		}
+		g.log.Warn("error getting vApp; leaving the remaining reads to the next poll",
+			"name", item.name, "href", item.href, "remaining", len(listed)-i, "error", err)
+		for _, rest := range listed[i:] {
+			unread = append(unread, rest.href)
+		}
+		break
 	}
-
-	return vApps, nil
+	return vApps, unread
 }
 
 // pollVM reads the IP address and OS type of a VM for the reconciler's poll.
