@@ -80,3 +80,27 @@ func TestOpLimiter_DrainHonoursContext(t *testing.T) {
 	defer cancel()
 	require.ErrorIs(t, l.drain(ctx), context.DeadlineExceeded)
 }
+
+func TestOpLimiter_ReserveOffLetsDeletesUseEverySlot(t *testing.T) {
+	l := newOpLimiter(4, 3, 5, nil)
+	l.setCreateReserve(false)
+	for i := 0; i < 4; i++ {
+		require.True(t, l.tryAcquire(opDelete))
+	}
+	assert.False(t, l.tryAcquire(opCreate))
+}
+
+func TestOpLimiter_ReserveBackOnCapsNewDeletes(t *testing.T) {
+	l := newOpLimiter(4, 3, 5, nil)
+	l.setCreateReserve(false)
+	for i := 0; i < 4; i++ {
+		require.True(t, l.tryAcquire(opDelete))
+	}
+	l.setCreateReserve(true)
+	l.release(opDelete)
+	l.release(opDelete)
+
+	require.True(t, l.tryAcquire(opDelete)) // 3 deletes: still within total-1
+	assert.False(t, l.tryAcquire(opDelete), "a 4th delete would take the create slot")
+	assert.True(t, l.tryAcquire(opCreate))
+}
