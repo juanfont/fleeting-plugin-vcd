@@ -125,6 +125,16 @@ var (
 		Help: "Unix time the last reconciliation cycle finished; alert when it stops advancing",
 	}, []string{instanceGroupLabel})
 
+	StartupHold = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "fleeting_vcd_startup_hold",
+		Help: "1 while creates are held for startup cleanup of the previous run's vApps, else 0",
+	}, []string{instanceGroupLabel})
+
+	StartupLeftoversRemaining = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "fleeting_vcd_startup_leftovers_remaining",
+		Help: "Leftover vApps from the previous run not yet deleted during startup cleanup",
+	}, []string{instanceGroupLabel})
+
 	LeftoverVAppsQueuedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fleeting_vcd_leftover_vapps_queued_total",
 		Help: "Total number of vApps not owned by this process that were queued for deletion",

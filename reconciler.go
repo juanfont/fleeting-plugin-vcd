@@ -21,8 +21,11 @@ const (
 	defaultMaxConcurrentOperations = 4
 	defaultCreateTimeout           = 20 * time.Minute
 	defaultStartupCleanupTimeout   = 30 * time.Minute
-	defaultMaxInstanceAge          = 24 * time.Hour
-	gcCheckEveryN                  = 360 // ~1h at 10s interval
+
+	// holdLogInterval is how often startup cleanup reports its progress.
+	holdLogInterval       = time.Minute
+	defaultMaxInstanceAge = 24 * time.Hour
+	gcCheckEveryN         = 360 // ~1h at 10s interval
 
 	// Retry backoff for per-intent retries
 	retryBaseDelay  = 10 * time.Second
@@ -110,7 +113,7 @@ type vcdInstanceGroup struct {
 	// Only the reconcile goroutine touches these.
 	startupHold   bool
 	startupPolled bool
-	holdLogged    bool
+	lastHoldLog   time.Time
 	startedAt     time.Time
 
 	// backgroundDeletes tracks failed-create cleanups in flight to avoid
@@ -361,11 +364,6 @@ type vmPollResult struct {
 
 func (r *vcdInstanceGroup) dispatchCreates() {
 	if r.startupHold {
-		if !r.holdLogged {
-			r.log.Info("holding creates until leftover vApps from the previous run are deleted",
-				"leftovers", r.store.LeftoverCount())
-			r.holdLogged = true
-		}
 		return
 	}
 	r.cbMu.Lock()
@@ -409,30 +407,64 @@ func (r *vcdInstanceGroup) updateStartupHold(pollOK bool) {
 	if !r.startupHold {
 		return
 	}
+	group := r.store.instanceGroupName
 	if pollOK && !r.startupPolled {
 		// The cleanup timeout counts from the first complete view of the
 		// group: while vCD cannot be listed, creates would fail anyway.
 		r.startupPolled = true
 		r.startedAt = time.Now()
+		r.lastHoldLog = r.startedAt
+		r.log.Info("startup cleanup started: holding creates until the previous run's vApps are deleted",
+			"leftovers", r.store.LeftoverCount(), "timeout", r.config.StartupCleanupTimeout)
 	}
+	StartupHold.WithLabelValues(group).Set(1)
 	if !r.startupPolled {
+		if time.Since(r.lastHoldLog) >= holdLogInterval {
+			r.lastHoldLog = time.Now()
+			r.log.Warn("startup cleanup waiting for a complete poll of the group; creates stay held")
+		}
 		return
 	}
-	remaining := r.store.LeftoverCount()
+	remaining, deleting := r.leftoverProgress()
+	StartupLeftoversRemaining.WithLabelValues(group).Set(float64(remaining))
+	elapsed := time.Since(r.startedAt)
 	switch {
 	case remaining == 0:
-		r.log.Info("startup cleanup complete, creating instances")
-	case time.Since(r.startedAt) >= r.config.StartupCleanupTimeout:
+		r.log.Info("startup cleanup complete, creating instances", "took", elapsed.Round(time.Second))
+	case elapsed >= r.config.StartupCleanupTimeout:
 		r.log.Warn("startup cleanup timed out, creating instances anyway",
 			"leftovers_remaining", remaining, "timeout", r.config.StartupCleanupTimeout)
 	default:
+		if time.Since(r.lastHoldLog) >= holdLogInterval {
+			r.lastHoldLog = time.Now()
+			r.log.Info("startup cleanup in progress, creates held",
+				"leftovers_remaining", remaining, "deleting", deleting,
+				"elapsed", elapsed.Round(time.Second),
+				"creates_released_in", (r.config.StartupCleanupTimeout - elapsed).Round(time.Second))
+		}
 		return
 	}
 	r.endStartupHold()
 }
 
+// leftoverProgress returns how many leftovers are not yet deleted and how many
+// of those are being deleted right now.
+func (r *vcdInstanceGroup) leftoverProgress() (remaining, deleting int) {
+	for _, inst := range r.store.GetAll() {
+		if !inst.Leftover || inst.Phase == PhaseDeleted {
+			continue
+		}
+		remaining++
+		if inst.Phase == PhaseDeleting {
+			deleting++
+		}
+	}
+	return remaining, deleting
+}
+
 func (r *vcdInstanceGroup) endStartupHold() {
 	r.startupHold = false
+	StartupHold.WithLabelValues(r.store.instanceGroupName).Set(0)
 }
 
 func (r *vcdInstanceGroup) doCreate(intentID string) {
