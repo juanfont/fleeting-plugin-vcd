@@ -114,7 +114,9 @@ type vcdInstanceGroup struct {
 	startupHold   bool
 	startupPolled bool
 	lastHoldLog   time.Time
-	startedAt     time.Time
+
+	status    statusBox
+	startedAt time.Time
 
 	// backgroundDeletes tracks failed-create cleanups in flight to avoid
 	// starting duplicates on every cycle.
@@ -260,6 +262,7 @@ func (r *vcdInstanceGroup) reconcileOnce(doGC bool) {
 		r.log.Error("error polling VCD", "error", pollErr)
 	}
 	r.updateStartupHold(pollErr == nil)
+	defer r.publishStatus(startTime, pollErr)
 
 	// Step 2: Dispatch pending creates
 	r.dispatchCreates()

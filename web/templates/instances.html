@@ -1,0 +1,15 @@
+{{range .}}
+<tr class="{{.Phase.String}}">
+  <td>{{if .Name}}{{.Name}}{{else}}<span class="muted" title="intent {{.IntentID}}">(not named yet)</span>{{end}}</td>
+  <td><span class="pill p-{{.Phase.String}}">{{.Phase.String}}</span></td>
+  <td title="{{clock .PhaseSince}}">{{ago .PhaseSince}}</td>
+  <td><span class="pill src-{{.Source}}">{{.Source}}</span></td>
+  <td>{{if .IPAddress}}<code>{{.IPAddress}}</code>{{else}}-{{end}}</td>
+  <td>{{if .VAppStatus}}{{.VAppStatus}}{{else}}-{{end}} / {{if .VMStatus}}{{.VMStatus}}{{else}}-{{end}}</td>
+  <td>{{if .RetryCount}}{{.RetryCount}}{{if .NextRetryAfter}} <span class="muted">(next {{ago .NextRetryAfter}})</span>{{end}}{{else}}0{{end}}</td>
+  <td class="err" title="{{.LastError}}">{{.LastError}}</td>
+  <td>{{if .ID}}<code title="{{.ID}}">{{shortHREF .ID}}</code>{{else}}-{{end}}</td>
+</tr>
+{{else}}
+<tr><td colspan="9" class="muted">No instances match.</td></tr>
+{{end}}

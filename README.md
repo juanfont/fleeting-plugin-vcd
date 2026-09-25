@@ -63,7 +63,7 @@ The plugin is configured via the GitLab Runner's `config.toml` file under `[runn
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `disk_size_gb` | Disk size in GB (0 = use template default) | `0` |
-| `debug_server_addr` | Debug HTTP server address (e.g., `127.0.0.1:27060`) | disabled |
+| `debug_server_addr` | Debug HTTP server address (e.g., `127.0.0.1:27060`). Serves a live status page at `/`, the same data as JSON at `/api/status`, and Prometheus metrics at `/metrics` | disabled |
 | `max_concurrent_creates` | Maximum number of VMs being created simultaneously | `3` |
 | `max_concurrent_deletes` | Maximum number of VMs being deleted simultaneously | `5` |
 | `max_concurrent_operations` | Maximum vCD operations (creates and deletes together, including restart cleanup) in flight. One slot is kept for creates when the value is 2 or more. Keep the sum across runners sharing a vCD organization below its simultaneous-operation limit | `4` |

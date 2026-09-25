@@ -1,0 +1,43 @@
+<div class="cards">
+  <div class="card">
+    <h2>Instances</h2>
+    <div class="big">{{.Total}}</div>
+    <div class="phases">{{range .Phases}}<span class="pill p-{{.Phase}}">{{.Phase}} {{.Count}}</span>{{else}}<span class="muted">none</span>{{end}}</div>
+  </div>
+  {{with .Status}}
+  {{if .StartupHold}}
+  <div class="card hold">
+    <h2>Startup cleanup · creates held</h2>
+    {{if .StartupPolled}}
+      <div class="big">{{.LeftoversRemaining}} leftovers remaining</div>
+      <div>{{.LeftoversDeleting}} deleting · started {{ago .HoldStartedAt}}</div>
+      <div class="muted">creates released when done, or {{releaseIn .}}</div>
+    {{else}}
+      <div class="big">waiting</div>
+      <div class="muted">for a complete poll of the group before deleting</div>
+    {{end}}
+  </div>
+  {{end}}
+  <div class="card">
+    <h2>Operations in flight</h2>
+    <div class="big">{{.CreatesInFlight}} create · {{.DeletesInFlight}} delete</div>
+    <div class="muted">limit {{.OpsLimit}}</div>
+  </div>
+  <div class="card{{if not .ThrottlePausedUntil.IsZero}} bad{{end}}">
+    <h2>vCD operation limit</h2>
+    {{if .ThrottlePausedUntil.IsZero}}<div class="big">ok</div><div class="muted">not throttled</div>
+    {{else}}<div class="big">paused</div><div>resumes in {{until .ThrottlePausedUntil}}</div>{{end}}
+  </div>
+  <div class="card{{if not .BreakerOpenUntil.IsZero}} bad{{end}}">
+    <h2>Create circuit breaker</h2>
+    {{if .BreakerOpenUntil.IsZero}}<div class="big">closed</div><div class="muted">{{.BreakerFailures}} consecutive failures</div>
+    {{else}}<div class="big">open</div><div>creates resume in {{until .BreakerOpenUntil}} · {{.BreakerFailures}} failures</div>{{end}}
+  </div>
+  <div class="card{{if .LastPollError}} bad{{end}}">
+    <h2>Reconcile loop</h2>
+    <div class="big" title="{{clock .LastReconcileAt}}">{{ago .LastReconcileAt}}</div>
+    <div class="muted">cycle took {{seconds .LastReconcileDurationSeconds}}</div>
+    {{if .LastPollError}}<div class="err" title="{{.LastPollError}}">poll: {{.LastPollError}}</div>{{end}}
+  </div>
+  {{end}}
+</div>

@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Summary.InstanceGroupName}} · fleeting-plugin-vcd</title>
+<script src="static/htmx.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#667085; --line:#e4e7ec;
+          --ok:#12805c; --warn:#b54708; --bad:#b42318; --info:#175cd3; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px 20px 40px; background:var(--bg); color:var(--ink);
+         font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:baseline; justify-content:space-between; margin-bottom:14px; }
+  h1 { font-size:18px; margin:0; overflow-wrap:anywhere; }
+  h1 small { color:var(--muted); font-weight:400; margin-left:6px; }
+  .controls { display:flex; gap:12px; align-items:center; color:var(--muted); flex-wrap:wrap; }
+  .controls select, .controls input { font:inherit; }
+  #live { display:inline-flex; align-items:center; gap:6px; }
+  #live .dot { width:8px; height:8px; border-radius:50%; background:var(--ok); }
+  body.stale #live .dot { background:var(--bad); }
+  body.stale #live .label::after { content:" (stale: last refresh failed)"; color:var(--bad); }
+  body.paused #live .dot { background:var(--muted); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; margin-bottom:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 4px; font-weight:600; }
+  .card .big { font-size:20px; font-weight:600; }
+  .card.hold { border-color:var(--warn); background:#fffaeb; }
+  .card.bad { border-color:var(--bad); background:#fef3f2; }
+  .muted { color:var(--muted); }
+  .phases { display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; white-space:nowrap; }
+  .p-Creating { background:#d1e9ff; color:#175cd3; } .p-PendingCreate { background:#fef0c7; color:#93370d; }
+  .p-Running { background:#d1fadf; color:#05603a; } .p-Deleting { background:#fee4e2; color:#b42318; }
+  .p-PendingDelete { background:#fde2d0; color:#9c2a10; } .p-Deleted { background:#eaecf0; color:#475467; }
+  .src-leftover { background:#fef0c7; color:#93370d; } .src-preexisting { background:#eaecf0; color:#344054; }
+  .src-created { background:#ecfdf3; color:#027a48; }
+  .tablewrap { overflow-x:auto; background:var(--card); border:1px solid var(--line); border-radius:8px; }
+  table { border-collapse:collapse; width:100%; min-width:900px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-size:12px; color:var(--muted); font-weight:600; background:#fafbfc; position:sticky; top:0; }
+  tr.Deleted td { color:var(--muted); }
+  td.err { color:var(--bad); max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  td code { font-size:12px; }
+  .filters { display:flex; gap:14px; align-items:center; margin:0 0 8px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>{{.Summary.InstanceGroupName}}<small>fleeting-plugin-vcd</small></h1>
+  <div class="controls">
+    <span id="live"><span class="dot"></span><span class="label">live</span></span>
+    <label>refresh
+      <select id="interval">
+        <option value="2">2s</option><option value="5" selected>5s</option>
+        <option value="15">15s</option><option value="0">paused</option>
+      </select>
+    </label>
+    <a href="api/status">JSON</a>
+    <a href="metrics">metrics</a>
+  </div>
+</header>
+
+<section id="summary" hx-get="fragments/summary" hx-trigger="refresh from:body" hx-swap="innerHTML">
+  {{template "summary.html" .Summary}}
+</section>
+
+<form id="filters" class="filters" onsubmit="return false">
+  <label><input type="checkbox" name="hide_deleted" checked> hide deleted</label>
+  <label>phase
+    <select name="phase">
+      <option value="">all</option>
+      {{range .Phases}}<option>{{.}}</option>{{end}}
+    </select>
+  </label>
+</form>
+
+<div class="tablewrap">
+  <table>
+    <thead><tr>
+      <th>Name</th><th>Phase</th><th>In phase</th><th>Source</th><th>IP</th>
+      <th>vApp / VM</th><th>Retries</th><th>Last error</th><th>vApp</th>
+    </tr></thead>
+    <tbody id="instances" hx-get="fragments/instances" hx-include="#filters"
+           hx-trigger="refresh from:body, change from:#filters" hx-swap="innerHTML">
+      {{template "instances.html" .Instances}}
+    </tbody>
+  </table>
+</div>
+
+<script>
+(function () {
+  var sel = document.getElementById("interval"), timer = null;
+  try { var saved = localStorage.getItem("refresh"); if (saved !== null) sel.value = saved; } catch (e) {}
+  function refresh() { if (!document.hidden) htmx.trigger(document.body, "refresh"); }
+  function schedule() {
+    clearInterval(timer);
+    var s = +sel.value;
+    document.body.classList.toggle("paused", s === 0);
+    if (s > 0) timer = setInterval(refresh, s * 1000);
+  }
+  sel.addEventListener("change", function () {
+    try { localStorage.setItem("refresh", sel.value); } catch (e) {}
+    schedule(); refresh();
+  });
+  // Catch up at once when the tab becomes visible again.
+  document.addEventListener("visibilitychange", function () { if (!document.hidden && +sel.value > 0) refresh(); });
+  document.body.addEventListener("htmx:afterRequest", function (e) {
+    document.body.classList.toggle("stale", !e.detail.successful);
+  });
+  schedule();
+})();
+</script>
+</body>
+</html>

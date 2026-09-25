@@ -95,6 +95,19 @@ func (g *throttleGate) paused() bool {
 	return false
 }
 
+// until returns when the current pause ends, or the zero time if none is active.
+func (g *throttleGate) until() time.Time {
+	if g == nil {
+		return time.Time{}
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.now().Before(g.pausedUntil) {
+		return g.pausedUntil
+	}
+	return time.Time{}
+}
+
 // wait blocks until no pause is active, including pauses extended while waiting.
 func (g *throttleGate) wait(ctx context.Context) error {
 	if g == nil {

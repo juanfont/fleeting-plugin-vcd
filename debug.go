@@ -1,9 +1,14 @@
 package vcd
 
 import (
+	"embed"
+	"encoding/json"
+	"fmt"
 	"html/template"
+	"io/fs"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -11,28 +16,46 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+//go:embed web
+var webFS embed.FS
+
+// phaseOrder lists phases in the order the debug page shows them.
+var phaseOrder = []Phase{PhaseCreating, PhasePendingCreate, PhaseRunning, PhaseDeleting, PhasePendingDelete, PhaseDeleted}
+
 type DebugServer struct {
 	log               hclog.Logger
 	store             *desiredStateStore
+	status            func() DebugStatus
 	router            *mux.Router
 	instanceGroupName string
+	tmpl              *template.Template
 }
 
-func NewDebugServer(log hclog.Logger, store *desiredStateStore, instanceGroupName string) *DebugServer {
+// NewDebugServer serves a live view of the instance group. status may be nil.
+func NewDebugServer(log hclog.Logger, store *desiredStateStore, instanceGroupName string, status func() DebugStatus) *DebugServer {
+	if status == nil {
+		status = func() DebugStatus { return DebugStatus{} }
+	}
 	ds := &DebugServer{
 		log:               log,
 		store:             store,
+		status:            status,
 		router:            mux.NewRouter(),
 		instanceGroupName: instanceGroupName,
+		tmpl:              template.Must(template.New("").Funcs(templateFuncs).ParseFS(webFS, "web/templates/*.html")),
 	}
-
 	ds.setupRoutes()
 	return ds
 }
 
 func (ds *DebugServer) setupRoutes() {
-	ds.router.HandleFunc("/", ds.handleInstancesTable).Methods("GET")
-	ds.router.HandleFunc("/instances", ds.handleInstancesTable).Methods("GET")
+	static, _ := fs.Sub(webFS, "web/static")
+	ds.router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.FS(static)))).Methods("GET")
+	ds.router.HandleFunc("/", ds.handlePage).Methods("GET")
+	ds.router.HandleFunc("/instances", ds.handlePage).Methods("GET")
+	ds.router.HandleFunc("/fragments/summary", ds.handleSummary).Methods("GET")
+	ds.router.HandleFunc("/fragments/instances", ds.handleInstances).Methods("GET")
+	ds.router.HandleFunc("/api/status", ds.handleAPIStatus).Methods("GET")
 	ds.router.Handle("/metrics", promhttp.Handler()).Methods("GET")
 }
 
@@ -40,149 +63,237 @@ func (ds *DebugServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ds.router.ServeHTTP(w, r)
 }
 
-func (ds *DebugServer) handleInstancesTable(w http.ResponseWriter, r *http.Request) {
-	ds.log.Debug("Serving instances debug table")
+type instanceView struct {
+	Instance
+	Source     string // created, leftover, preexisting
+	PhaseSince *time.Time
+}
 
-	instances := ds.store.GetAll()
+type summaryView struct {
+	InstanceGroupName string
+	Status            DebugStatus
+	Phases            []phaseCount
+	Total             int
+	Now               time.Time
+}
 
-	// Sort by CreatedAt from newest to oldest
-	sort.Slice(instances, func(i, j int) bool {
-		if instances[i].CreatedAt == nil && instances[j].CreatedAt == nil {
-			return false
+type phaseCount struct {
+	Phase string
+	Count int
+}
+
+func (ds *DebugServer) summary() summaryView {
+	counts := map[Phase]int{}
+	all := ds.store.GetAll()
+	for _, inst := range all {
+		counts[inst.Phase]++
+	}
+	v := summaryView{InstanceGroupName: ds.instanceGroupName, Status: ds.status(), Total: len(all), Now: time.Now()}
+	for _, p := range phaseOrder {
+		if counts[p] > 0 {
+			v.Phases = append(v.Phases, phaseCount{p.String(), counts[p]})
 		}
-		if instances[i].CreatedAt == nil {
-			return false
+	}
+	return v
+}
+
+func (ds *DebugServer) instances(hideDeleted bool, phase string) []instanceView {
+	var out []instanceView
+	for _, inst := range ds.store.GetAll() {
+		if hideDeleted && inst.Phase == PhaseDeleted {
+			continue
 		}
-		if instances[j].CreatedAt == nil {
-			return true
+		if phase != "" && inst.Phase.String() != phase {
+			continue
 		}
-		return instances[i].CreatedAt.After(*instances[j].CreatedAt)
+		out = append(out, instanceView{Instance: inst, Source: instanceSource(inst), PhaseSince: phaseSince(inst)})
+	}
+	rank := map[Phase]int{}
+	for i, p := range phaseOrder {
+		rank[p] = i
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if rank[out[i].Phase] != rank[out[j].Phase] {
+			return rank[out[i].Phase] < rank[out[j].Phase]
+		}
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		// Stable order for unnamed intents, so rows do not shuffle between refreshes.
+		return out[i].IntentID < out[j].IntentID
 	})
+	return out
+}
 
-	tmpl := `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>VCD Fleeting Plugin - Instance State Debug</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        table { border-collapse: collapse; width: 100%; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
-        .header { margin-bottom: 20px; }
-        .refresh-info { margin-top: 20px; font-size: 0.9em; color: #666; }
-        .deleted-row { background-color: #f8f9fa; opacity: 0.6; color: #6c757d; }
-        .deleting-row { background-color: #f8d7da; }
-        .creating-row { background-color: #fff3cd; }
-        .preexisting-row { background-color: #fff3e0; }
-        .preexisting-yes { background-color: #ff9800; color: #ffffff; font-weight: bold; text-align: center; }
-        .preexisting-no { color: #28a745; font-weight: bold; text-align: center; }
-        .phase { font-weight: bold; text-align: center; padding: 4px 8px; border-radius: 4px; }
-        .phase-PendingCreate { background-color: #fff3cd; color: #856404; }
-        .phase-Creating { background-color: #cce5ff; color: #004085; }
-        .phase-Running { background-color: #d4edda; color: #155724; }
-        .phase-PendingDelete { background-color: #f8d7da; color: #721c24; }
-        .phase-Deleting { background-color: #f5c6cb; color: #721c24; }
-        .phase-Deleted { background-color: #f8f9fa; color: #6c757d; }
-        .retry-count { font-weight: bold; color: #dc3545; }
-        .error-text { color: #dc3545; font-size: 0.85em; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    </style>
-    <meta http-equiv="refresh" content="5">
-</head>
-<body>
-    <div class="header">
-        <h1>VCD Fleeting Plugin - Instance State Debug</h1>
-		<p>Instance group name: <b>{{.InstanceGroupName}}</b> (via vApp metadata key tag <b>{{.InstanceGroupMetadataKey}}</b>)</p>
-        <p>Total Instances: <b>{{len .Instances}}</b></p>
-        <p>Last Updated: <b>{{.LastUpdated}}</b></p>
-    </div>
-
-    <table>
-        <thead>
-            <tr>
-                <th>Intent ID</th>
-                <th>VApp HREF</th>
-                <th>Preexisting</th>
-                <th>Phase</th>
-                <th>VApp Name</th>
-                <th>VM Name</th>
-                <th>VApp Status</th>
-                <th>VM Status</th>
-                <th>IP Address</th>
-                <th>Retries</th>
-                <th>Last Error</th>
-                <th>Next Retry</th>
-                <th>Created At</th>
-                <th>Create Started</th>
-                <th>Create Completed</th>
-                <th>Delete Requested</th>
-                <th>Delete Started</th>
-                <th>Delete Completed</th>
-                <th>GC Marked</th>
-                <th>Last Updated</th>
-            </tr>
-        </thead>
-        <tbody>
-            {{range .Instances}}
-            <tr class="{{if eq .Phase.String "Deleted"}}deleted-row{{else if eq .Phase.String "Deleting"}}deleting-row{{else if eq .Phase.String "PendingDelete"}}deleting-row{{else if eq .Phase.String "Creating"}}creating-row{{else if eq .Phase.String "PendingCreate"}}creating-row{{else if not .CreatedAt}}preexisting-row{{end}}">
-                <td>{{.IntentID}}</td>
-                <td>{{.ID}}</td>
-                <td class="{{if not .CreatedAt}}preexisting-yes{{else}}preexisting-no{{end}}">{{if not .CreatedAt}}YES{{else}}NO{{end}}</td>
-                <td class="phase phase-{{.Phase.String}}">{{.Phase.String}}</td>
-                <td>{{.Name}}</td>
-                <td>{{.VMName}}</td>
-                <td>{{.VAppStatus}}</td>
-                <td>{{.VMStatus}}</td>
-                <td>{{.IPAddress}}</td>
-                <td class="{{if gt .RetryCount 0}}retry-count{{end}}">{{.RetryCount}}</td>
-                <td class="error-text" title="{{.LastError}}">{{.LastError}}</td>
-                <td>{{if .NextRetryAfter}}{{.NextRetryAfter.Format "15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .CreatedAt}}{{.CreatedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .CreateStartedAt}}{{.CreateStartedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .CreateCompletedAt}}{{.CreateCompletedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .DeleteRequestedAt}}{{.DeleteRequestedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .DeleteStartedAt}}{{.DeleteStartedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .DeleteCompletedAt}}{{.DeleteCompletedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .GCMarkedAt}}{{.GCMarkedAt.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-                <td>{{if .LastUpdated}}{{.LastUpdated.Format "2006-01-02 15:04:05"}}{{else}}-{{end}}</td>
-            </tr>
-            {{else}}
-            <tr>
-                <td colspan="20" style="text-align: center; font-style: italic;">No instances found</td>
-            </tr>
-            {{end}}
-        </tbody>
-    </table>
-
-    <div class="refresh-info">
-        <p>This page auto-refreshes every 5 seconds.</p>
-    </div>
-</body>
-</html>`
-
-	t, err := template.New("instances").Parse(tmpl)
-	if err != nil {
-		ds.log.Error("Failed to parse template", "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+func instanceSource(inst Instance) string {
+	switch {
+	case inst.Leftover:
+		return "leftover"
+	case inst.CreatedAt == nil:
+		return "preexisting"
+	default:
+		return "created"
 	}
+}
 
-	data := struct {
-		Instances                []Instance
-		InstanceGroupName        string
-		InstanceGroupMetadataKey string
-		LastUpdated              string
-	}{
-		Instances:                instances,
-		InstanceGroupName:        ds.instanceGroupName,
-		InstanceGroupMetadataKey: instanceGroupMetadataKey,
-		LastUpdated:              time.Now().Format("2006-01-02 15:04:05"),
+// phaseSince returns when the instance entered its current phase, as far as
+// the recorded timestamps tell.
+func phaseSince(inst Instance) *time.Time {
+	switch inst.Phase {
+	case PhasePendingCreate:
+		return inst.CreatedAt
+	case PhaseCreating:
+		return inst.CreateStartedAt
+	case PhaseRunning:
+		return inst.CreateCompletedAt
+	case PhasePendingDelete:
+		return inst.DeleteRequestedAt
+	case PhaseDeleting:
+		return inst.DeleteStartedAt
+	case PhaseDeleted:
+		return inst.DeleteCompletedAt
 	}
+	return nil
+}
 
-	w.Header().Set("Content-Type", "text/html")
-	if err := t.Execute(w, data); err != nil {
-		ds.log.Error("Failed to execute template", "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+func (ds *DebugServer) render(w http.ResponseWriter, name string, data any) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := ds.tmpl.ExecuteTemplate(w, name, data); err != nil {
+		ds.log.Error("debug page render failed", "template", name, "error", err)
+		http.Error(w, "render failed", http.StatusInternalServerError)
 	}
+}
+
+func (ds *DebugServer) handlePage(w http.ResponseWriter, r *http.Request) {
+	ds.render(w, "page.html", struct {
+		Summary   summaryView
+		Instances []instanceView
+		Phases    []string
+	}{ds.summary(), ds.instances(true, ""), phaseNames()})
+}
+
+func (ds *DebugServer) handleSummary(w http.ResponseWriter, r *http.Request) {
+	ds.render(w, "summary.html", ds.summary())
+}
+
+func (ds *DebugServer) handleInstances(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	ds.render(w, "instances.html", ds.instances(q.Get("hide_deleted") != "", q.Get("phase")))
+}
+
+type apiInstance struct {
+	IntentID  string     `json:"intent_id"`
+	HREF      string     `json:"href,omitempty"`
+	Name      string     `json:"name,omitempty"`
+	Phase     string     `json:"phase"`
+	Source    string     `json:"source"`
+	Leftover  bool       `json:"leftover"`
+	IPAddress string     `json:"ip,omitempty"`
+	Retries   int        `json:"retries"`
+	LastError string     `json:"last_error,omitempty"`
+	Since     *time.Time `json:"phase_since,omitempty"`
+}
+
+func (ds *DebugServer) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
+	sum := ds.summary()
+	phases := map[string]int{}
+	for _, p := range sum.Phases {
+		phases[p.Phase] = p.Count
+	}
+	var insts []apiInstance
+	for _, v := range ds.instances(false, "") {
+		insts = append(insts, apiInstance{
+			IntentID: v.IntentID, HREF: v.ID, Name: v.Name, Phase: v.Phase.String(), Source: v.Source,
+			Leftover: v.Leftover, IPAddress: v.IPAddress, Retries: v.RetryCount, LastError: v.LastError, Since: v.PhaseSince,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(map[string]any{
+		"instance_group": ds.instanceGroupName,
+		"status":         sum.Status,
+		"phases":         phases,
+		"instances":      insts,
+	}); err != nil {
+		ds.log.Error("debug status encode failed", "error", err)
+	}
+}
+
+func phaseNames() []string {
+	var out []string
+	for _, p := range phaseOrder {
+		out = append(out, p.String())
+	}
+	return out
+}
+
+var templateFuncs = template.FuncMap{
+	// ago renders a timestamp relative to now, e.g. "3m12s ago".
+	"ago": func(t any) string {
+		var ts time.Time
+		switch v := t.(type) {
+		case time.Time:
+			ts = v
+		case *time.Time:
+			if v == nil {
+				return "-"
+			}
+			ts = *v
+		}
+		if ts.IsZero() {
+			return "-"
+		}
+		d := time.Since(ts)
+		if d < 0 {
+			return "in " + (-d).Round(time.Second).String()
+		}
+		return d.Round(time.Second).String() + " ago"
+	},
+	"until": func(t time.Time) string {
+		if t.IsZero() {
+			return "-"
+		}
+		return time.Until(t).Round(time.Second).String()
+	},
+	"clock": func(t any) string {
+		switch v := t.(type) {
+		case time.Time:
+			if v.IsZero() {
+				return ""
+			}
+			return v.UTC().Format(time.RFC3339)
+		case *time.Time:
+			if v == nil {
+				return ""
+			}
+			return v.UTC().Format(time.RFC3339)
+		}
+		return ""
+	},
+	"releaseIn": func(st DebugStatus) string {
+		if st.HoldStartedAt.IsZero() {
+			return "after the first complete poll"
+		}
+		left := time.Duration(st.HoldTimeoutSeconds*float64(time.Second)) - time.Since(st.HoldStartedAt)
+		if left < 0 {
+			left = 0
+		}
+		return fmt.Sprintf("in %s at the latest", left.Round(time.Second))
+	},
+	// shortHREF shows the vApp id's first block, e.g. "vapp-042dfab4".
+	"shortHREF": func(href string) string {
+		if i := strings.LastIndex(href, "/"); i >= 0 {
+			href = href[i+1:]
+		}
+		if len(href) > 13 {
+			return href[:13]
+		}
+		return href
+	},
+	"seconds": func(s float64) string {
+		return (time.Duration(s * float64(time.Second))).Round(time.Millisecond).String()
+	},
 }

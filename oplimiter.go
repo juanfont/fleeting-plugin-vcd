@@ -27,6 +27,7 @@ type opLimiter struct {
 	gate         *throttleGate
 	reserve      atomic.Bool
 	deletesInUse atomic.Int64
+	createsInUse atomic.Int64
 }
 
 func newOpLimiter(total, maxCreates, maxDeletes int, gate *throttleGate) *opLimiter {
@@ -67,6 +68,8 @@ func (l *opLimiter) tryAcquire(kind opKind) bool {
 	}
 	if kind == opDelete {
 		l.deletesInUse.Add(1)
+	} else {
+		l.createsInUse.Add(1)
 	}
 	return true
 }
@@ -74,6 +77,8 @@ func (l *opLimiter) tryAcquire(kind opKind) bool {
 func (l *opLimiter) release(kind opKind) {
 	if kind == opDelete {
 		l.deletesInUse.Add(-1)
+	} else {
+		l.createsInUse.Add(-1)
 	}
 	l.total.Release(1)
 	l.kindSem(kind).Release(1)

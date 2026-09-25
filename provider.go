@@ -115,7 +115,7 @@ func (g *InstanceGroup) Init(ctx context.Context, logger hclog.Logger, settings 
 
 	// Initialize debug server if address is configured
 	if g.DebugServerAddr != "" {
-		g.debugServer = NewDebugServer(g.log, g.store, g.InstanceGroupName)
+		g.debugServer = NewDebugServer(g.log, g.store, g.InstanceGroupName, reconciler.DebugStatus)
 		g.httpServer = &http.Server{
 			Addr:    g.DebugServerAddr,
 			Handler: g.debugServer,
